@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*.*.*'
 
 jobs:
   # SEC-001: Block the release if no completed audit report has been published
@@ -93,3 +95,42 @@ jobs:
           gh release create "$TAG" \
             --title "Release $TAG" \
             --notes-file release_notes.md
+
+  publish-sdk:
+    name: Publish SDK to npm
+    needs: [audit-gate, check-version]
+    if: needs.check-version.outputs.tag_exists == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          registry-url: https://registry.npmjs.org/
+
+      - name: Check if version already published on npm
+        id: check_npm
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          if npm view "@pulsar/sdk@$VERSION" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "Version $VERSION is already published on npm; skipping publish."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.check_npm.outputs.published == 'false'
+        working-directory: sdk
+        run: npm ci
+
+      - name: Publish to npm
+        if: steps.check_npm.outputs.published == 'false'
+        working-directory: sdk
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

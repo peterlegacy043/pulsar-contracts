@@ -80,8 +80,9 @@ Every event delivers a `POST` to the registered URL with this JSON body:
   "ledger": 1234567,
   "timestamp": 1717200000,
   "data": {
-    "id": "0000000000000000-0000000000000000-0",
-    "value": { ... }
+    "paymentId": "0000000000000000-0000000000000000-0",
+    "amount": "10000000",
+    "merchant": "GXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
   }
 }
 ```
@@ -98,6 +99,23 @@ Every event delivers a `POST` to the registered URL with this JSON body:
 | `multisig_initiated` | A multisig payment was initiated |
 | `multisig_signed` | A signer signed a multisig payment |
 | `multisig_executed` | A multisig payment was executed |
+
+### `data` payload schema
+
+The `data` object only contains the fields explicitly allowlisted for each event type:
+
+| `event` | Allowlisted `data` fields |
+|---|---|
+| `payment_processed` | `paymentId`, `amount`, `merchant` |
+| `refund_initiated` | `refundId`, `paymentId`, `amount`, `merchant` |
+| `refund_approved` | `refundId`, `paymentId`, `approver` |
+| `refund_rejected` | `refundId`, `paymentId`, `approver`, `reason` |
+| `refund_executed` | `refundId`, `paymentId`, `amount`, `merchant` |
+| `multisig_initiated` | `paymentId`, `amount`, `merchant`, `signers` |
+| `multisig_signed` | `paymentId`, `signer` |
+| `multisig_executed` | `paymentId`, `amount`, `merchant` |
+
+> **Note:** Any other fields present on the raw Soroban event are stripped before delivery and are never forwarded to merchants. Unknown event types receive an empty `data` object (`{}`).
 
 ---
 

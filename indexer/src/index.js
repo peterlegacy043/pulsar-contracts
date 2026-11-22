@@ -8,15 +8,30 @@ const {
   CONTRACT_ID,
   DATABASE_URL,
   PORT = 3001,
+  INDEXER_API_KEY,
 } = process.env;
 
 const db = new Pool({ connectionString: DATABASE_URL });
 const app = express();
 app.use(express.json());
 
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+// Fail closed: if no key is configured, deny all access.
+function requireApiKey(req, res, next) {
+  if (!INDEXER_API_KEY) {
+    return res.status(500).json({ error: 'Server misconfigured: INDEXER_API_KEY not set' });
+  }
+  const provided = req.headers['x-api-key'];
+  if (!provided || provided !== INDEXER_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
 // ── REST API ──────────────────────────────────────────────────────────────────
 
-app.get('/events', async (req, res) => {
+app.get('/events', requireApiKey, async (req, res) => {
   const { type, limit = 50, offset = 0 } = req.query;
   const params = [Number(limit), Number(offset)];
   let where = '';
@@ -28,7 +43,7 @@ app.get('/events', async (req, res) => {
   res.json(rows);
 });
 
-app.get('/events/:type', async (req, res) => {
+app.get('/events/:type', requireApiKey, async (req, res) => {
   const { rows } = await db.query(
     'SELECT * FROM events WHERE event_type = $1 ORDER BY ledger DESC LIMIT 50',
     [req.params.type]

@@ -438,6 +438,82 @@ jobs:
           NETWORK: testnet
         run: bash scripts/smoke-test.sh
 
+  # SEC-017: Verify the frontend deployment serves the required security
+  # headers (CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy).
+  # The preview URL is taken from the PREVIEW_URL repository variable (or the
+  # PREVIEW_URL secret as a fallback). Runs on push to main/develop, on a
+  # schedule, and via manual dispatch. Skipped when no URL is configured so
+  # forks and unconfigured repos are not broken.
+  security-headers:
+    name: Security Headers Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    steps:
+      - name: Resolve preview URL
+        id: url
+        env:
+          PREVIEW_URL_VAR: ${{ vars.PREVIEW_URL }}
+          PREVIEW_URL_SECRET: ${{ secrets.PREVIEW_URL }}
+        run: |
+          URL="${PREVIEW_URL_VAR:-$PREVIEW_URL_SECRET}"
+          if [ -z "$URL" ]; then
+            echo "::warning::PREVIEW_URL is not configured (set the PREVIEW_URL repository variable or secret). Skipping security header check."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check security headers with curl
+        if: steps.url.outputs.configured == 'true'
+        env:
+          URL: ${{ steps.url.outputs.url }}
+        run: |
+          set -euo pipefail
+          echo "Fetching headers from: $URL"
+          HEADERS=$(curl -sSIL --max-time 30 "$URL")
+          echo "$HEADERS"
+
+          FAIL=0
+          check_header() {
+            local name="$1" pattern="$2"
+            if echo "$HEADERS" | grep -qiE "^${name}:[[:space:]]*${pattern}"; then
+              echo "✅ ${name} present and matches /${pattern}/i"
+            else
+              echo "::error::Missing or invalid header: ${name} (expected to match /${pattern}/i)"
+              FAIL=1
+            fi
+          }
+
+          check_header "Content-Security-Policy" ".+"
+          check_header "X-Frame-Options" "DENY"
+          check_header "X-Content-Type-Options" "nosniff"
+          check_header "Referrer-Policy" "strict-origin-when-cross-origin"
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::One or more required security headers are missing. See docs/security-headers.md for configuration guidance."
+            exit 1
+          fi
+          echo "All required security headers are present."
+
+      - name: Secondary check via securityheaders.com API
+        if: steps.url.outputs.configured == 'true'
+        continue-on-error: true
+        env:
+          URL: ${{ steps.url.outputs.url }}
+        run: |
+          set -euo pipefail
+          # securityheaders.com has no public JSON API; use its HTML report as
+          # a best-effort secondary signal. This step is non-blocking.
+          REPORT=$(curl -sSL --max-time 30 \
+            -H "User-Agent: ci-security-headers-check" \
+            "https://securityheaders.com/?q=${URL}&followRedirects=on" || true)
+          if echo "$REPORT" | grep -qi "Content-Security-Policy"; then
+            echo "securityheaders.com report fetched successfully."
+          else
+            echo "::warning::Could not parse securityheaders.com report; primary curl check already passed."
+          fi
+
   # SEC-008: Scheduled weekly job that refreshes the cargo-audit advisory
   # database and re-runs the audit so that newly published advisories are
   # caught within a week, independently of any code change.
