@@ -90,6 +90,99 @@ your code:
 - **No unsafe**: do not use `unsafe` blocks.
 - **No std**: the contract crate is `#![no_std]`; keep it that way.
 
+## Adding a Contract Function
+
+Follow these steps when adding a new public entry-point to a Soroban
+contract (e.g. `contracts/payment-processing-contract`):
+
+1. **`types.rs`** — if the function introduces a new struct, enum, or
+   storage-key variant, define it here first. Reuse existing types where
+   possible.
+2. **`storage.rs`** — add a small accessor pair (`get_x` / `set_x`) for any
+   new piece of persistent state, following the existing pattern of one
+   function per storage key. Call `storage::bump_instance_ttl(&env)` from
+   the public entry-point, not from the accessor.
+3. **`error.rs`** — if the function can fail in a new way, add a variant to
+   `PaymentError` with the next free discriminant and a doc comment
+   explaining when it's returned and how to avoid it.
+4. **`lib.rs`** — add the `pub fn` to the `#[contractimpl]` block. Include:
+   - a doc comment describing behaviour and linking any related issue tag
+     (e.g. `SEC-009`, `MISC-XXX`),
+   - an `# Errors` section listing every `PaymentError` variant it can
+     return,
+   - an admin check (`helper::require_multi_admin`) if the function mutates
+     privileged state.
+5. **`test.rs`** (or a dedicated `*_tests.rs` file for larger features) —
+   add at least one success-path test and one failure-path test per new
+   error variant. Reuse the `setup()`, `make_order()`, `admins()` helpers
+   already defined near the top of `test.rs`.
+6. **`docs/contract-abi.json`** — add the new function's signature, inputs,
+   and outputs so off-chain consumers can discover it.
+7. **SDK regeneration** — if `sdk/` is generated from the ABI, re-run its
+   generation script (see `sdk/README.md`) so TypeScript/JS clients pick up
+   the new method.
+
+### Worked example: adding `set_merchant_tier`
+
+Suppose we want admins to set a merchant's tier:
+
+- `types.rs`: add `pub enum MerchantTier { Standard, Premium }` (if not
+  already present).
+- `storage.rs`: add `pub fn set_merchant_tier(env: &Env, merchant: &Address, tier: &MerchantTier)`
+  and `pub fn get_merchant_tier(env: &Env, merchant: &Address) -> MerchantTier`.
+- `error.rs`: add `MerchantNotFound = 72` if the merchant must already be
+  registered and the lookup can fail.
+- `lib.rs`: add
+  ```rust
+  pub fn set_merchant_tier(
+      env: Env,
+      admins: Vec<Address>,
+      merchant: Address,
+      tier: MerchantTier,
+  ) -> Result<(), PaymentError> {
+      storage::bump_instance_ttl(&env);
+      helper::require_multi_admin(&env, admins)?;
+      if !storage::merchant_exists(&env, &merchant) {
+          return Err(PaymentError::MerchantNotFound);
+      }
+      storage::set_merchant_tier(&env, &merchant, &tier);
+      Ok(())
+  }
+  ```
+- `test.rs`: add `test_set_merchant_tier_success` and
+  `test_set_merchant_tier_unknown_merchant_fails`.
+- `docs/contract-abi.json`: add the `set_merchant_tier` entry with its
+  parameter types.
+- Regenerate the SDK client so `client.setMerchantTier(...)` exists.
+
+See the [README](README.md#contributing) for a link back to this guide.
+
+## Adding / Updating a Translation
+
+The frontend (`frontend/`) uses [`react-i18next`](https://react.i18next.com/)
+for internationalisation. All translation strings live under
+`frontend/src/locales/<lang>.json`, keyed by feature area
+(e.g. `checkout.payNow`). `en.json` is the source of truth — every other
+locale file must have the exact same key structure.
+
+To add a new locale:
+
+1. Copy `frontend/src/locales/en.json` to `frontend/src/locales/<lang>.json`
+   and translate every value (never the keys).
+2. Register the new locale's `resources` entry in
+   `frontend/src/lib/i18n.ts`.
+3. Do not remove or rename a key in `en.json` without updating it in every
+   other locale file in the same PR — a missing key silently falls back to
+   English via `fallbackLng`.
+
+To add a new user-facing string in a component:
+
+1. Add the key to `frontend/src/locales/en.json` (and translate it in the
+   other locale files, or leave an English placeholder with a `// TODO`
+   comment if you don't speak the target language).
+2. In the component, call `const { t } = useTranslation();` and render
+   `t("area.key")` instead of a hardcoded string.
+
 ## Branch Protection Rules
 
 The `main` branch is protected with the following enforced settings:
@@ -113,7 +206,20 @@ The following jobs in `.github/workflows/ci.yml` must all pass before merging:
 - `build` — WASM artifact compiles and passes the binary size gate
 - `security-audit` — `cargo audit` reports no known vulnerabilities
 - `deny` — `cargo deny check` (licence and duplicate-crate policy)
-- `coverage` — generates test coverage report (warning only, does not block)
+- `coverage` — line coverage must be at or above `COVERAGE_THRESHOLD` (default 80%); fails the job otherwise
+
+### Coverage requirement
+
+CI enforces a minimum line-coverage threshold. The `coverage` job fails (and
+blocks the merge) when line coverage drops below the threshold, so PRs that
+reduce coverage cannot be merged silently.
+
+- The threshold is defined by the `COVERAGE_THRESHOLD` variable in
+  `.github/workflows/ci.yml` and defaults to **80** (percent).
+- To adjust the threshold, change the value of `COVERAGE_THRESHOLD` in the
+  workflow's `env` block — no other edits are required.
+- Before opening a PR, run the tests locally and add tests for any new code so
+  coverage stays at or above the threshold.
 
 ### Why these rules exist
 
@@ -128,6 +234,27 @@ These rules are enforced via GitHub branch protection settings. Contributors
 cannot bypass them. Maintainers (repo admins) can view and edit the settings
 at:
 `https://github.com/queenannaE/pulsar-contracts/settings/branches`
+
+## Tagging Convention
+
+Release tags **must** follow [semantic versioning](https://semver.org/) in the
+form `vMAJOR.MINOR.PATCH` — for example `v1.2.3`, `v0.1.0`, or `v2.0.0-rc.1`.
+
+The release workflow (`.github/workflows/release.yml`) only triggers on tags
+matching the pattern `v[0-9]+.[0-9]+.[0-9]+*`; any other tag (e.g. `test`,
+`v1`, or `release-1.2.3`) will not produce a release. A CI job step also
+validates the tag against this pattern before continuing, so a malformed tag
+fails the workflow rather than producing an unorderable artifact.
+
+```bash
+# Correct
+git tag v1.2.3
+git push origin v1.2.3
+
+# Incorrect — will not trigger a release
+git tag test
+git tag v1
+```
 
 ## Pull Request Guidelines
 
@@ -187,6 +314,28 @@ following private channels:
 
 See [SECURITY.md](SECURITY.md) for the full disclosure policy, response SLA,
 and the list of information to include in your report.
+
+## Secret Rotation & Offboarding
+
+Secrets such as `TESTNET_SECRET_KEY` and other CI credentials must be rotated
+whenever a team member leaves the project or changes role, and on a regular
+schedule regardless. The full procedure for each secret is documented in
+[docs/SECRET_ROTATION.md](docs/SECRET_ROTATION.md).
+
+**Offboarding checklist** (run when a maintainer or contributor with secret
+access departs or changes role):
+
+- [ ] Revoke the departing member's GitHub access (organisation membership,
+      repository collaborator access, and any deploy keys or PATs they created).
+- [ ] Rotate `TESTNET_SECRET_KEY` and any mainnet keys they had access to,
+      following [docs/SECRET_ROTATION.md](docs/SECRET_ROTATION.md).
+- [ ] Rotate any secrets shared via `.env` files (local or CI-provided) that
+      the member could read.
+- [ ] Record the rotation date and the person who performed it in the rotation
+      log described in [docs/SECRET_ROTATION.md](docs/SECRET_ROTATION.md).
+
+**Recommended schedule:** rotate all secrets **annually**, and additionally on
+any role change, suspected compromise, or offboarding event.
 
 ## License
 

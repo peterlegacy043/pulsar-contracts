@@ -1,6 +1,20 @@
 /* PaymentTable — responsive table / card layout
  * Breakpoint: < 640 px → card list; >= 640 px → standard table
+ *
+ * All colors come from theme variables (see App.css). The dark-mode
+ * fallback below only applies when no explicit theme attribute is set,
+ * so the table/card layout renders correctly under prefers-color-scheme.
  */
+
+:root:not([data-theme]) {
+  --payment-table-fallback: 1;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+  }
+}
 
 /* ── Wrapper ─────────────────────────────────────────────────────── */
 .payment-table-wrapper {

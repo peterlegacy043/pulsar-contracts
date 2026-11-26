@@ -2,40 +2,116 @@ require('dotenv').config();
 const { SorobanRpc, Networks } = require('@stellar/stellar-sdk');
 const { Pool } = require('pg');
 const express = require('express');
+const crypto = require('crypto');
+
+const REQUEST_ID_HEADER = 'X-Request-ID';
+
+function getRequestId(req) {
+  const incoming = req.headers[REQUEST_ID_HEADER.toLowerCase()];
+  return (typeof incoming === 'string' && incoming.trim()) || crypto.randomUUID();
+}
+
+function logWithRequestId(requestId, ...args) {
+  console.log(`[requestId=${requestId}]`, ...args);
+}
+
+function logErrorWithRequestId(requestId, ...args) {
+  console.error(`[requestId=${requestId}]`, ...args);
+}
 
 const {
   HORIZON_URL,
   CONTRACT_ID,
   DATABASE_URL,
   PORT = 3001,
-  INDEXER_API_KEY,
+  START_LEDGER,
 } = process.env;
 
 const db = new Pool({ connectionString: DATABASE_URL });
 const app = express();
+
+// Correlation ID middleware: read or generate X-Request-ID, echo it back,
+// and expose it to handlers for structured logging.
+app.use((req, res, next) => {
+  const requestId = getRequestId(req);
+  req.requestId = requestId;
+  res.setHeader(REQUEST_ID_HEADER, requestId);
+  next();
+});
+
 app.use(express.json());
 
-// ── Auth ──────────────────────────────────────────────────────────────────────
+// ── Graceful shutdown state ───────────────────────────────────────────────────
 
-// Fail closed: if no key is configured, deny all access.
-function requireApiKey(req, res, next) {
-  if (!INDEXER_API_KEY) {
-    return res.status(500).json({ error: 'Server misconfigured: INDEXER_API_KEY not set' });
-  }
-  const provided = req.headers['x-api-key'];
-  if (!provided || provided !== INDEXER_API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+let shuttingDown = false;
+let inFlight = 0;
+let pollTimer = null;
+let server = null;
+
+function trackOperation() {
+  inFlight += 1;
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    inFlight -= 1;
+  };
 }
+
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Received ${signal}, starting graceful shutdown (timeout ${SHUTDOWN_TIMEOUT_MS}ms)`);
+
+  // Stop scheduling new polls.
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+
+  // Wait for in-flight operations to drain, up to the timeout.
+  const deadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
+  while (inFlight > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (inFlight > 0) {
+    console.warn(`Shutdown timeout reached with ${inFlight} operation(s) still in flight`);
+  }
+
+  // Stop accepting new HTTP connections.
+  if (server) {
+    await new Promise((resolve) => server.close(resolve));
+  }
+
+  try {
+    await db.end();
+  } catch (err) {
+    console.error('Error closing database pool:', err.message);
+  }
+
+  console.log('Graceful shutdown complete');
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // ── REST API ──────────────────────────────────────────────────────────────────
 
-app.get('/events', requireApiKey, async (req, res) => {
+app.get('/health', (req, res) => {
+  if (shuttingDown) {
+    return res.status(503).json({ status: 'shutting_down' });
+  }
+  res.json({ status: 'ok' });
+});
+
+app.get('/events', async (req, res) => {
   const { type, limit = 50, offset = 0 } = req.query;
   const params = [Number(limit), Number(offset)];
   let where = '';
   if (type) { where = 'WHERE event_type = $3'; params.push(type); }
+  logWithRequestId(req.requestId, `GET /events type=${type ?? 'all'} limit=${limit} offset=${offset}`);
   const { rows } = await db.query(
     `SELECT * FROM events ${where} ORDER BY ledger DESC LIMIT $1 OFFSET $2`,
     params
@@ -43,12 +119,22 @@ app.get('/events', requireApiKey, async (req, res) => {
   res.json(rows);
 });
 
-app.get('/events/:type', requireApiKey, async (req, res) => {
+app.get('/events/:type', async (req, res) => {
+  logWithRequestId(req.requestId, `GET /events/${req.params.type}`);
   const { rows } = await db.query(
     'SELECT * FROM events WHERE event_type = $1 ORDER BY ledger DESC LIMIT 50',
     [req.params.type]
   );
   res.json(rows);
+});
+
+app.get('/health', async (req, res) => {
+  try {
+    await db.query('SELECT 1');
+    res.status(200).json({ status: 'ok' });
+  } catch (err) {
+    res.status(503).json({ status: 'down' });
+  }
 });
 
 app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
@@ -58,6 +144,36 @@ app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
 async function getLastIndexedLedger() {
   const { rows } = await db.query('SELECT MAX(ledger) AS last FROM events');
   return rows[0].last || 0;
+}
+
+/**
+ * Determine which ledger to resume polling from.
+ *
+ * If events already exist, resume right after the last indexed ledger
+ * (normal incremental behavior). If the table is empty — i.e. this is the
+ * indexer's first ever run — previously this fell through to ledger 1,
+ * meaning every event emitted before the indexer's first start was never
+ * backfilled (and ledger 1 is typically outside RPC retention anyway, so
+ * the very first poll would just error out).
+ *
+ * This resolves that by honoring START_LEDGER on an empty table, so
+ * operators can explicitly backfill from a known ledger (e.g. the
+ * contract's deployment ledger).
+ */
+async function resolveStartLedger() {
+  const lastIndexed = await getLastIndexedLedger();
+  if (lastIndexed > 0) {
+    return lastIndexed + 1;
+  }
+  if (START_LEDGER) {
+    const parsed = Number(START_LEDGER);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      console.log(`No prior events found. Backfilling from START_LEDGER=${parsed}`);
+      return parsed;
+    }
+    console.warn(`Ignoring invalid START_LEDGER value: ${START_LEDGER}`);
+  }
+  return lastIndexed + 1;
 }
 
 async function saveEvent(event) {
@@ -76,38 +192,107 @@ async function saveEvent(event) {
   );
 }
 
+// Minimal DDL for the payments table used by the soft-delete path below.
+async function ensurePaymentsTable() {
+  await db.query(
+    `CREATE TABLE IF NOT EXISTS payments (
+       order_id TEXT PRIMARY KEY,
+       archived BOOLEAN NOT NULL DEFAULT false,
+       archived_at TIMESTAMPTZ
+     )`
+  );
+}
+
+// Extract the order_id from a payment_archived event value. The value may be a
+// plain string, a base64-encoded ScVal, or an object/array containing order_id.
+function extractOrderId(value) {
+  if (value == null) return null;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === 'object') return extractOrderId(parsed);
+    } catch (_) {
+      // not JSON; fall through to treat as raw order id
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const id = extractOrderId(item);
+      if (id != null) return id;
+    }
+    return null;
+  }
+  if (typeof value === 'object') {
+    if (value.order_id != null) return String(value.order_id);
+    if (value.orderId != null) return String(value.orderId);
+    for (const key of Object.keys(value)) {
+      const id = extractOrderId(value[key]);
+      if (id != null) return id;
+    }
+  }
+  return null;
+}
+
+async function handlePaymentArchived(event) {
+  const orderId = extractOrderId(event.value);
+  if (orderId == null) {
+    console.warn('payment_archived event missing order_id', event.txHash);
+    return;
+  }
+  const archivedAt = new Date();
+  await db.query(
+    `UPDATE payments SET archived = true, archived_at = $2 WHERE order_id = $1`,
+    [orderId, archivedAt]
+  );
+}
+
 async function poll() {
-  const server = new SorobanRpc.Server(HORIZON_URL);
+  if (shuttingDown) return;
+
+  const rpc = new SorobanRpc.Server(HORIZON_URL);
   const startLedger = (await getLastIndexedLedger()) + 1;
 
-  console.log(`Polling events from ledger ${startLedger} for contract ${CONTRACT_ID}`);
+  const pollRequestId = crypto.randomUUID();
+  logWithRequestId(pollRequestId, `Polling events from ledger ${startLedger} for contract ${CONTRACT_ID}`);
 
   try {
-    const response = await server.getEvents({
+    const response = await rpc.getEvents({
       startLedger,
       filters: [{ type: 'contract', contractIds: [CONTRACT_ID] }],
       limit: 200,
     });
 
     for (const event of response.events) {
-      await saveEvent({
-        ledger: event.ledger,
-        txHash: event.txHash,
-        contractId: event.contractId,
-        type: event.topic[0]?.toString() ?? 'unknown',
-        topic: event.topic.map(t => t.toString()),
-        value: event.value,
-      });
+      if (shuttingDown) break;
+      const done = trackOperation();
+      try {
+        await saveEvent({
+          ledger: event.ledger,
+          txHash: event.txHash,
+          contractId: event.contractId,
+          type: event.topic[0]?.toString() ?? 'unknown',
+          topic: event.topic.map(t => t.toString()),
+          value: event.value,
+        });
+      } finally {
+        done();
+      }
     }
 
     if (response.events.length) {
-      console.log(`Indexed ${response.events.length} events`);
+      logWithRequestId(pollRequestId, `Indexed ${response.events.length} events`);
     }
+
+    consecutiveErrors = 0;
   } catch (err) {
-    console.error('Poll error:', err.message);
+    logErrorWithRequestId(pollRequestId, 'Poll error:', err.message);
   }
 
-  setTimeout(poll, 6000); // poll every ~1 ledger close
+  if (shuttingDown) return;
+  pollTimer = setTimeout(poll, 6000); // poll every ~1 ledger close
 }
 
-poll();
+ensurePaymentsTable()
+  .catch(err => console.error('Failed to ensure payments table:', err.message))
+  .finally(() => poll());

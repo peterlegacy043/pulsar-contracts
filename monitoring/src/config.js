@@ -10,8 +10,23 @@
 const config = {
   // ── Stellar network ────────────────────────────────────────────────────────
 
-  /** Horizon base URL. Use https://horizon.stellar.org for Mainnet. */
+  /**
+   * Horizon base URL. Use https://horizon.stellar.org for Mainnet.
+   *
+   * SECURITY: The monitoring service should only connect to official Horizon
+   * URLs (e.g. https://horizon.stellar.org, https://horizon-testnet.stellar.org)
+   * or audited mirrors.  Plain-HTTP URLs are rejected with a startup warning
+   * because a MITM proxy could otherwise silently serve fraudulent data.
+   */
   horizonUrl: process.env.HORIZON_URL || "https://horizon-testnet.stellar.org",
+
+  /**
+   * Optional path to a PEM-encoded CA bundle used to validate the Horizon TLS
+   * certificate (env: HORIZON_CA_CERT).  Set this when connecting through a
+   * corporate/self-hosted network whose proxy presents a custom CA.  Leave
+   * empty to use the system trust store.
+   */
+  horizonCaCert: process.env.HORIZON_CA_CERT || "",
 
   /** The deployed contract ID to monitor. */
   contractId: process.env.CONTRACT_ID || "",
@@ -77,6 +92,18 @@ if (!config.contractId) {
   console.warn(
     "[config] WARNING: CONTRACT_ID is not set. " +
       "Set the CONTRACT_ID environment variable to the deployed contract address."
+  );
+}
+
+// SECURITY: Enforce HTTPS for Horizon connections.  Only official Horizon URLs
+// or audited mirrors should be used; a plain-HTTP endpoint could be spoofed by
+// a MITM proxy.
+if (!config.horizonUrl.startsWith("https:")) {
+  console.warn(
+    "[config] WARNING: HORIZON_URL does not use https: (" +
+      config.horizonUrl +
+      "). The monitoring service should only connect to official Horizon URLs " +
+      "or audited mirrors over HTTPS."
   );
 }
 

@@ -17,6 +17,7 @@ Pulsar is a comprehensive payment-processing smart contract for the Stellar Soro
 | [API Reference](docs/api-reference.md) | All function signatures, parameter types, return types, and event schemas |
 | [Contract ABI (JSON)](docs/contract-abi.json) | Machine-readable ABI for tooling and code generation |
 | [Idempotency Guide](docs/IDEMPOTENCY_GUIDE.md) | Handling network retries and `PaymentAlreadyExists` safely |
+| [Subscription Guide](docs/SUBSCRIPTION_GUIDE.md) | Recurring-payment lifecycle and the off-chain scheduler requirements |
 
 ---
 
@@ -44,6 +45,7 @@ Pulsar is a comprehensive payment-processing smart contract for the Stellar Soro
 - [Storage Costs](#storage-costs)
 - [Roadmap](#roadmap)
 - [Known Limitations](#known-limitations)
+- [Security](#security)
 - [Contributing](#contributing)
 - [Code of Conduct](#code-of-conduct)
 - [License](#license)
@@ -970,6 +972,11 @@ Client → API Gateway (rate limit: N req/min per account) → Stellar RPC → C
 
 A simple token-bucket or sliding-window limiter keyed on the caller's Stellar address is sufficient. Libraries such as `express-rate-limit` (Node.js) or `slowapi` (Python) can be used for this purpose.
 
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for planned features, priorities, and release milestones (v0.1, v0.2, v1.0).
+
 ## Known Limitations
 
 ### `get_global_payment_stats` — date filtering is a no-op (SC-003)
@@ -1002,9 +1009,38 @@ all tracked deployments.
 
 ---
 
+## Security
+
+Found a vulnerability? **Do not open a public issue.** Report it privately via
+the [GitHub security advisory form](https://github.com/queenannaE/pulsar-contracts/security/advisories/new)
+or by email to `euniceoyiefieo@gmail.com`. See [SECURITY.md](SECURITY.md) for
+the full disclosure policy and response SLA.
+
+### Bug bounty and researcher recognition
+
+Pulsar runs a **recognition-based** security program — valid reports earn
+credit in the release notes, a place in the
+[Security Hall of Fame](SECURITY.md#security-hall-of-fame), and credit in any
+published advisory. A paid bounty on an established platform (Immunefi or
+HackerOne) is planned once the independent audit (SEC-001) and mainnet
+deployment are complete.
+
+The program covers the on-chain contract **and** the off-chain services
+(`api/`, `indexer/`, `monitoring/`, `services/`, `sdk/`, `dashboard/`,
+`frontend/`). See
+[Rewards and Recognition](SECURITY.md#rewards-and-recognition) for the reward
+details, what counts as a valid report, and the full
+[bounty scope](SECURITY.md#bounty-scope).
+
+---
+
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md), including the
+[Adding a Contract Function](CONTRIBUTING.md#adding-a-contract-function)
+guide and the
+[Adding / updating a translation](CONTRIBUTING.md#adding--updating-a-translation)
+guide for frontend i18n contributions.
 
 The `main` branch is protected: all changes require a pull request with at
 least 1 approving review and all CI checks passing. Direct pushes and

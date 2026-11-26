@@ -6,6 +6,9 @@ import React, {
   useState,
 } from "react";
 
+// NOTE: unit tests for the localStorage read/write cycle live in
+// ThemeProvider.test.tsx alongside this file.
+
 type Theme = "light" | "dark";
 
 interface ThemeContextValue {

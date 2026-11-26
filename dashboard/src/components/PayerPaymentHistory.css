@@ -118,6 +118,21 @@
 .pph__refund-status--completed { color: #004085; }
 .pph__refund-status--rejected  { color: var(--error); }
 
+:root[data-theme='dark'] .pph__refund-status--pending   { color: #f2c94c; }
+:root[data-theme='dark'] .pph__refund-status--approved  { color: #6fcf97; }
+:root[data-theme='dark'] .pph__refund-status--completed { color: #56b4e9; }
+
+/* ── prefers-color-scheme fallback (no explicit theme set) ── */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .pph__badge--completed         { background: #1a3d27; color: #6fcf97; }
+  :root:not([data-theme]) .pph__badge--partiallyrefunded { background: #3d3010; color: #f2c94c; }
+  :root:not([data-theme]) .pph__badge--fullyrefunded     { background: #0d2a45; color: #56b4e9; }
+
+  :root:not([data-theme]) .pph__refund-status--pending   { color: #f2c94c; }
+  :root:not([data-theme]) .pph__refund-status--approved  { color: #6fcf97; }
+  :root:not([data-theme]) .pph__refund-status--completed { color: #56b4e9; }
+}
+
 /* ── Pagination ───────────────────────────────────────────── */
 .pph__pagination {
   display: flex;

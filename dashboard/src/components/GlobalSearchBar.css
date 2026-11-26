@@ -74,7 +74,7 @@
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 4px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  box-shadow: 0 4px 12px var(--shadow, rgba(0, 0, 0, 0.12));
   max-height: 280px;
   overflow-y: auto;
   /* Scroll anchoring for keyboard navigation */
@@ -116,4 +116,12 @@
   font-size: 0.78rem;
   color: var(--muted-text);
   font-family: monospace;
+}
+
+/* ── Dark mode fallback (system preference) ──────────────── */
+/* Applies only when no explicit theme has been set on :root. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --shadow: rgba(0, 0, 0, 0.5);
+  }
 }

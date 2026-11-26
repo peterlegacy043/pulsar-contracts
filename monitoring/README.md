@@ -55,7 +55,8 @@ hard-coded in source.
 | Variable | Default | Description |
 |---|---|---|
 | `CONTRACT_ID` | *(required)* | Deployed contract address to monitor |
-| `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Horizon base URL |
+| `HORIZON_URL` | `https://horizon-testnet.stellar.org` | Horizon base URL (must use `https:`) |
+| `HORIZON_CA_CERT` | *(empty)* | Path to a custom CA bundle (PEM) used to verify the Horizon TLS certificate; required only for self-hosted or corporate-network Horizon endpoints |
 | `POLL_INTERVAL_MS` | `15000` | How often to poll Horizon (ms) |
 | `PING_INTERVAL_MS` | `300000` | How often to call the contract `ping` health check (ms, default 5 min) |
 | `REFUND_RATE_THRESHOLD` | `0.20` | Refund rate alert threshold (0–1) |
@@ -64,11 +65,35 @@ hard-coded in source.
 | `ERROR_RATE_THRESHOLD` | `0.05` | Poll error rate alert threshold (0–1) |
 | `ALERT_WEBHOOK_URL` | *(empty)* | Webhook URL for alert delivery |
 
+### Horizon endpoint trust (SEC-015)
+
+The monitor should **only** connect to official Horizon URLs:
+
+- `https://horizon.stellar.org` (mainnet)
+- `https://horizon-testnet.stellar.org` (testnet)
+
+or to mirrors that have been audited by your team. Pointing `HORIZON_URL` at
+an arbitrary third-party endpoint risks consuming fraudulent contract state.
+
+Additional safeguards:
+
+- **HTTPS enforcement** — the monitor logs a warning at startup if
+  `HORIZON_URL` does not use the `https:` scheme. Plain-HTTP endpoints are
+  unauthenticated and vulnerable to tampering.
+- **Custom CA bundle** — in self-hosted or corporate-network environments
+  where a TLS-intercepting proxy presents a private CA, set
+  `HORIZON_CA_CERT` to the path of a PEM bundle containing the CA(s) you
+  trust. The monitor passes this bundle to the Horizon client so the
+  endpoint's certificate is validated against it. Leave it unset to use the
+  system trust store.
+
 ### Example `.env` file
 
 ```bash
 CONTRACT_ID=CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
 HORIZON_URL=https://horizon.stellar.org
+# Optional: custom CA bundle for self-hosted / corporate Horizon endpoints
+# HORIZON_CA_CERT=/etc/ssl/certs/corporate-ca.pem
 POLL_INTERVAL_MS=15000
 PING_INTERVAL_MS=300000
 REFUND_RATE_THRESHOLD=0.20
@@ -172,20 +197,50 @@ Adjust the ping interval via the `PING_INTERVAL_MS` environment variable
 
 The monitor is a long-running Node.js process. Recommended deployment options:
 
-- **Docker** — wrap in a minimal `node:18-alpine` image and deploy alongside
-  your existing infrastructure.
+- **Docker** — use the provided `monitoring/Dockerfile` (minimal
+  `node:18-alpine` image) and deploy alongside your existing infrastructure.
 - **systemd** — use a unit file with `Restart=always` for bare-metal servers.
 - **Cloud Run / ECS / Fly.io** — deploy as a single-container service.
 
-A minimal `Dockerfile` example:
+### Docker
 
-```dockerfile
-FROM node:18-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --omit=dev
-COPY src/ ./src/
-CMD ["node", "src/monitor.js"]
+A `Dockerfile` is included in this directory. Build and run it directly:
+
+```bash
+cd monitoring
+
+# Build the image
+docker build -t pulsar-monitor .
+
+# Run with your .env file (see "Example .env file" above)
+docker run --env-file .env pulsar-monitor
+```
+
+On startup the container logs a message including the configured Horizon URL,
+for example:
+
+```
+[monitor] starting — contract=C... horizon=https://horizon-testnet.stellar.org
+```
+
+If the container exits immediately, check that `CONTRACT_ID` is set and that
+`HORIZON_URL` is reachable from inside the container.
+
+### Docker Compose
+
+The `monitoring` service is defined in the repository root
+`docker-compose.yml`, with all environment variables bound from your shell or
+a root-level `.env` file. From the repository root:
+
+```bash
+docker compose up monitoring
+```
+
+To run it in the background:
+
+```bash
+docker compose up -d monitoring
+docker compose logs -f monitoring
 ```
 
 ---

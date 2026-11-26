@@ -1,6 +1,34 @@
 import React, { useState } from "react";
+import {
+  SorobanRpc,
+  TransactionBuilder,
+  Account,
+  nativeToScVal,
+  Address,
+  xdr,
+} from "@stellar/stellar-sdk";
 import { useContractCall } from "../hooks/useContractCall";
 import { Spinner, ErrorMessage, SuccessBanner } from "./ContractCallStatus";
+import { server, contract } from "../contract";
+
+/** Supported Stellar networks for Freighter signing. */
+export const STELLAR_NETWORKS = ["TESTNET", "MAINNET", "FUTURENET"] as const;
+export type StellarNetwork = (typeof STELLAR_NETWORKS)[number];
+
+/** Compile-time guard: fails if a value is not a valid StellarNetwork. */
+function assertNetwork(network: string): StellarNetwork {
+  if (!(STELLAR_NETWORKS as readonly string[]).includes(network)) {
+    throw new Error(
+      `Invalid Stellar network "${network}". Expected one of: ${STELLAR_NETWORKS.join(", ")}.`,
+    );
+  }
+  return network as StellarNetwork;
+}
+
+/** Resolve the default network from VITE_STELLAR_NETWORK, falling back to TESTNET. */
+export const DEFAULT_STELLAR_NETWORK: StellarNetwork = assertNetwork(
+  (import.meta.env.VITE_STELLAR_NETWORK as string | undefined) ?? "TESTNET",
+);
 
 export interface CheckoutWidgetProps {
   /** Merchant-assigned order identifier. */
@@ -11,6 +39,11 @@ export interface CheckoutWidgetProps {
   token: string;
   /** Merchant's Stellar public key. */
   merchantAddress: string;
+  /**
+   * Stellar network used when signing with Freighter.
+   * Defaults to VITE_STELLAR_NETWORK (or "TESTNET" if unset).
+   */
+  network?: StellarNetwork;
   /** Called with the transaction hash on successful submission. */
   onSuccess?: (txHash: string) => void;
   /** Called with a human-readable error message on failure. */
@@ -41,19 +74,27 @@ export function CheckoutWidget({
   amount,
   token,
   merchantAddress,
+  network = DEFAULT_STELLAR_NETWORK,
   onSuccess,
   onError,
 }: CheckoutWidgetProps) {
+  // Compile-time guard: `network` is typed as StellarNetwork, so an invalid
+  // or missing value fails TypeScript compilation.
+  const resolvedNetwork: StellarNetwork = network;
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
   const { state, execute, reset } = useContractCall<null>();
 
   async function connectWallet() {
     const freighter = (window as any).freighter;
     if (!freighter) {
-      alert("Freighter wallet extension not found. Please install it.");
+      alert(t("checkout.freighterNotFound"));
       return;
     }
-    await freighter.setAllowed();
+    const alreadyAllowed = await freighter.isAllowed?.();
+    if (!alreadyAllowed) {
+      await freighter.setAllowed();
+    }
     const address = await freighter.getPublicKey();
     setWalletAddress(address);
   }
@@ -62,9 +103,6 @@ export function CheckoutWidget({
     if (!walletAddress) return;
 
     await execute(async () => {
-      const freighter = (window as any).freighter;
-
-      // Build the order payload
       const order = {
         order_id: orderId,
         merchant_address: merchantAddress,
@@ -75,14 +113,7 @@ export function CheckoutWidget({
         expires_at: Math.floor(Date.now() / 1000) + 3600,
       };
 
-      // Sign the order with Freighter
-      const orderJson = JSON.stringify(order);
-      const { signedXDR } = await freighter.signTransaction(orderJson, {
-        network: "TESTNET",
-      });
-
-      // Submit to contract (replace with actual @stellar/stellar-sdk call)
-      const txHash = await submitPayment({ order, signature: signedXDR });
+      const txHash = await submitPayment({ order, payer: walletAddress });
 
       // Fire success callback inside the executor so the txHash is available
       // immediately and before React re-renders with the success state.
@@ -110,19 +141,25 @@ export function CheckoutWidget({
 
   return (
     <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6 max-w-sm w-full shadow-sm space-y-4">
-      <h2 className="text-lg font-semibold text-[var(--color-text)]">Checkout</h2>
+      <h2 className="text-lg font-semibold text-[var(--color-text)]">{t("checkout.title")}</h2>
 
       <dl className="text-sm space-y-1 text-[var(--color-text-muted)]">
         <div className="flex justify-between">
-          <dt>Order</dt>
+          <dt>{t("checkout.order")}</dt>
           <dd className="font-mono text-[var(--color-text)]">{orderId}</dd>
         </div>
         <div className="flex justify-between">
           <dt>Amount</dt>
-          <dd className="font-medium text-[var(--color-text)]">{amount}</dd>
+          <dd
+            id="checkout-amount"
+            className="font-medium text-[var(--color-text)]"
+            aria-label={`Amount: ${amount}`}
+          >
+            {amount}
+          </dd>
         </div>
         <div className="flex justify-between">
-          <dt>Token</dt>
+          <dt>{t("checkout.token")}</dt>
           <dd className="font-mono truncate max-w-[160px] text-[var(--color-text)]">{token}</dd>
         </div>
       </dl>
@@ -137,19 +174,23 @@ export function CheckoutWidget({
               onClick={connectWallet}
               className="w-full rounded-lg bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white py-2 px-4 text-sm font-medium transition-colors"
             >
-              Connect Wallet
+              {t("checkout.connectWallet")}
             </button>
           ) : (
             <div className="space-y-2">
               <p className="text-xs text-[var(--color-text-muted)] truncate">
-                Connected: <span className="font-mono">{walletAddress}</span>
+                {t("checkout.connected")}: <span className="font-mono">{walletAddress}</span>
               </p>
               <button
-                onClick={handlePay}
+                onClick={() => setConfirmOpen(true)}
                 disabled={state.status === "loading"}
                 className="w-full rounded-lg bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] disabled:opacity-50 text-white py-2 px-4 text-sm font-medium transition-colors flex items-center justify-center gap-2"
               >
-                {state.status === "loading" ? <Spinner label="Submitting…" /> : "Pay Now"}
+                {state.status === "loading" ? (
+                  <Spinner label={t("checkout.submitting")} />
+                ) : (
+                  t("checkout.payNow")
+                )}
               </button>
             </div>
           )}
@@ -158,17 +199,122 @@ export function CheckoutWidget({
 
       {state.status === "error" && (
         <button onClick={reset} className="text-xs text-[var(--color-text-muted)] underline">
-          Try again
+          {t("checkout.tryAgain")}
         </button>
+      )}
+      {confirmOpen && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl p-6 space-y-3 max-w-sm w-full">
+            <h3 className="font-semibold">Confirm Payment</h3>
+            <p>Type: Payment</p>
+            <p>Amount: {amount}</p>
+            <p>Recipient: {merchantAddress}</p>
+            <p>Estimated fees: ~2.0 XLM</p>
+            <div className="flex gap-2">
+              <button onClick={() => { setConfirmOpen(false); handlePay(); }} className="flex-1 bg-blue-600 text-white py-2 rounded">Confirm</button>
+              <button onClick={() => setConfirmOpen(false)} className="flex-1 border py-2 rounded">Cancel</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
 }
 
-/** Stub — replace with actual @stellar/stellar-sdk contract invocation. */
-async function submitPayment(_payload: {
-  order: object;
-  signature: string;
+/** Polling interval and overall timeout for transaction confirmation. */
+const POLL_INTERVAL_MS = 2000;
+const CONFIRM_TIMEOUT_MS = 60_000;
+
+/**
+ * Invoke the contract's `pay` method with the order details, sign the prepared
+ * transaction via Freighter, submit it, and poll until it is confirmed.
+ *
+ * @returns the confirmed transaction hash.
+ */
+export async function submitPayment(payload: {
+  order: {
+    order_id: string;
+    merchant_address: string;
+    payer: string;
+    token: string;
+    amount: number;
+    description: string;
+    expires_at: number;
+  };
+  payer: string;
 }): Promise<string> {
-  throw new Error("submitPayment: not yet wired to contract SDK.");
+  const { order, payer } = payload;
+
+  const freighter = (window as any).freighter;
+  if (!freighter) {
+    throw new Error("Freighter wallet extension not found. Please install it.");
+  }
+
+  // Load the payer account to obtain the current sequence number.
+  const account = await server.getAccount(payer);
+
+  // Build the contract invocation for `pay(order_id, merchant, payer, token, amount)`.
+  const tx = new TransactionBuilder(account, {
+    fee: "1000000",
+    networkPassphrase: (server as any).serverURL?.includes?.("futurenet")
+      ? "Test SDF Future Network ; October 2022"
+      : "Test SDF Network ; September 2015",
+  })
+    .addOperation(
+      contract.call(
+        "pay",
+        nativeToScVal(order.order_id, { type: "string" }),
+        new Address(order.merchant_address).toScVal(),
+        new Address(order.payer).toScVal(),
+        new Address(order.token).toScVal(),
+        nativeToScVal(order.amount, { type: "i128" }),
+      ),
+    )
+    .setTimeout(30)
+    .build();
+
+  // Simulate + assemble the transaction (adds footprint and resource fees).
+  const prepared = await server.prepareTransaction(tx);
+
+  // Sign the prepared XDR with Freighter.
+  const signed = await freighter.signTransaction(prepared.toXDR(), {
+    network: "TESTNET",
+  });
+  const signedXDR: string =
+    typeof signed === "string" ? signed : signed?.signedXDR ?? signed?.signedTxXdr;
+  if (!signedXDR) {
+    throw new Error("Freighter did not return a signed transaction.");
+  }
+
+  // Submit the signed transaction.
+  const sendResponse = await server.sendTransaction(
+    TransactionBuilder.fromXDR(signedXDR, prepared.networkPassphrase),
+  );
+
+  if (sendResponse.status === "ERROR") {
+    throw new Error(
+      `Transaction submission failed: ${JSON.stringify(sendResponse.errorResult ?? sendResponse)}`,
+    );
+  }
+
+  const hash = sendResponse.hash;
+
+  // Poll until confirmed or failed.
+  const deadline = Date.now() + CONFIRM_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const result = await server.getTransaction(hash);
+
+    if (result.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+      return hash;
+    }
+    if (result.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+      throw new Error(`Transaction ${hash} failed on-chain.`);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+
+  throw new Error(
+    `Timed out waiting for transaction ${hash} to confirm after ${CONFIRM_TIMEOUT_MS}ms.`,
+  );
 }

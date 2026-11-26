@@ -92,3 +92,33 @@ export function cacheTtlFromEnv(): number {
   if (!Number.isFinite(parsed) || parsed < 0) return 0;
   return Math.floor(parsed);
 }
+
+if (process.env.NODE_ENV === 'test') {
+  describe('AnalyticsCache TTL expiry', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+      jest.setSystemTime(new Date('2024-01-01T00:00:00Z'));
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('evicts expired entries and calls the loader again', async () => {
+      const cache = new AnalyticsCache(1);
+      const loader = jest.fn().mockResolvedValue('value');
+
+      const first = await cache.getOrCompute('key', loader);
+      expect(first).toBe('value');
+      expect(loader).toHaveBeenCalledTimes(1);
+      expect(cache.size).toBe(1);
+
+      jest.advanceTimersByTime(1100);
+
+      const second = await cache.getOrCompute('key', loader);
+      expect(second).toBe('value');
+      expect(loader).toHaveBeenCalledTimes(2);
+      expect(cache.size).toBe(1);
+    });
+  });
+}

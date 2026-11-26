@@ -3,6 +3,7 @@ import { useAdminAuth } from "../hooks/useAdminAuth";
 import { useAuditLog } from "../hooks/useAuditLog";
 import { useContractCall } from "../hooks/useContractCall";
 import { Spinner, ErrorMessage, SuccessBanner } from "./ContractCallStatus";
+import { ErrorBoundary } from "./ErrorBoundary";
 
 interface GlobalStats {
   totalPayments: number;
@@ -17,8 +18,11 @@ interface Merchant {
 }
 
 interface AdminPanelProps {
-  /** The on-chain admin address used to verify wallet auth. */
-  adminAddress: string;
+  /**
+   * Optional hint for the expected admin address. The actual admin is always
+   * verified on-chain via the contract's `get_admin` read function.
+   */
+  adminAddress?: string;
   /** Async fn to fetch global stats from the contract. */
   fetchStats: () => Promise<GlobalStats>;
   /** Async fn to fetch merchant list. */
@@ -29,7 +33,15 @@ interface AdminPanelProps {
   triggerCleanup: (caller: string) => Promise<string>;
 }
 
-export function AdminPanel({
+export function AdminPanel(props: AdminPanelProps) {
+  return (
+    <ErrorBoundary>
+      <AdminPanelContent {...props} />
+    </ErrorBoundary>
+  );
+}
+
+function AdminPanelContent({
   adminAddress,
   fetchStats,
   fetchMerchants,
@@ -39,12 +51,14 @@ export function AdminPanel({
   const auth = useAdminAuth(adminAddress);
   const { log, record } = useAuditLog();
   const statsCall = useContractCall<GlobalStats>();
+  const merchantsCall = useContractCall<Merchant[]>();
   const cleanupCall = useContractCall<null>();
   const deactivateCall = useContractCall<null>();
 
   const [stats, setStats] = useState<GlobalStats | null>(null);
   const [merchants, setMerchants] = useState<Merchant[]>([]);
   const [tab, setTab] = useState<"stats" | "merchants" | "log">("stats");
+  const [pendingDeactivation, setPendingDeactivation] = useState<Merchant | null>(null);
 
   async function loadStats() {
     await statsCall.execute(async () => {
@@ -56,9 +70,12 @@ export function AdminPanel({
   }
 
   async function loadMerchants() {
-    const list = await fetchMerchants();
-    setMerchants(list);
-    record("fetch_merchants", auth.address!);
+    await merchantsCall.execute(async () => {
+      const list = await fetchMerchants();
+      setMerchants(list);
+      record("fetch_merchants", auth.address!);
+      return { result: list, txHash: "" };
+    });
   }
 
   async function handleDeactivate(merchantAddress: string) {
@@ -89,6 +106,25 @@ export function AdminPanel({
           className="rounded-lg bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white py-2 px-6 text-sm font-medium transition-colors"
         >
           Connect Wallet
+        </button>
+      </div>
+    );
+  }
+
+  if (auth.isVerifying) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[200px] gap-4">
+        <Spinner label="Verifying admin access…" />
+      </div>
+    );
+  }
+
+  if (auth.error) {
+    return (
+      <div className="space-y-3">
+        <ErrorMessage message={`Failed to verify admin access: ${auth.error}`} />
+        <button onClick={auth.disconnect} className="underline text-sm text-[var(--color-text-muted)]">
+          Disconnect
         </button>
       </div>
     );
@@ -175,10 +211,22 @@ export function AdminPanel({
         <div className="space-y-3">
           <button
             onClick={loadMerchants}
-            className="rounded-lg bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white py-1.5 px-4 text-sm font-medium transition-colors"
+            disabled={merchantsCall.state.status === "loading"}
+            className="rounded-lg bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] disabled:opacity-50 text-white py-1.5 px-4 text-sm font-medium transition-colors flex items-center gap-2"
           >
-            Load Merchants
+            {merchantsCall.state.status === "loading" ? <Spinner label="Loading…" /> : "Load Merchants"}
           </button>
+          {merchantsCall.state.status === "error" && <ErrorMessage message={merchantsCall.state.message} />}
+          {merchantsCall.state.status === "loading" && merchants.length === 0 && (
+            <div className="space-y-2" aria-hidden="true">
+              {[0, 1, 2].map(i => (
+                <div
+                  key={i}
+                  className="h-8 rounded bg-[var(--color-surface)] border border-[var(--color-border)] animate-pulse"
+                />
+              ))}
+            </div>
+          )}
           {deactivateCall.state.status === "success" && <SuccessBanner txHash={deactivateCall.state.txHash} />}
           {deactivateCall.state.status === "error" && <ErrorMessage message={deactivateCall.state.message} />}
           {merchants.length > 0 && (
@@ -204,7 +252,7 @@ export function AdminPanel({
                     <td className="py-2">
                       {m.active && (
                         <button
-                          onClick={() => handleDeactivate(m.address)}
+                          onClick={() => setPendingDeactivation(m)}
                           disabled={deactivateCall.state.status === "loading"}
                           className="text-xs text-red-600 dark:text-red-400 underline disabled:opacity-50"
                         >
@@ -217,6 +265,38 @@ export function AdminPanel({
               </tbody>
             </table>
           )}
+        </div>
+      )}
+
+      {/* Deactivation confirmation modal */}
+      {pendingDeactivation && (
+        <div className="admin-modal-overlay">
+          <div className="admin-modal" role="dialog" aria-modal="true" aria-labelledby="deactivate-modal-title">
+            <h2 id="deactivate-modal-title" className="admin-modal-title">
+              Deactivate {pendingDeactivation.name}? This cannot be undone from this UI.
+            </h2>
+            <p className="admin-modal-warning">
+              ⚠️ This will immediately deactivate the merchant and cannot be reversed from this interface.
+            </p>
+            <div className="admin-modal-actions">
+              <button
+                onClick={() => {
+                  const address = pendingDeactivation.address;
+                  setPendingDeactivation(null);
+                  handleDeactivate(address);
+                }}
+                className="admin-modal-confirm"
+              >
+                Confirm
+              </button>
+              <button
+                onClick={() => setPendingDeactivation(null)}
+                className="admin-modal-cancel"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

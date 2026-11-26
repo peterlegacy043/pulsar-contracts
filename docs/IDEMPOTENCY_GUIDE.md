@@ -74,15 +74,53 @@ The REST API (`api/`) returns **HTTP 200** (not 201) when a duplicate
 This lets API consumers distinguish a fresh creation (HTTP 201) from a
 safe-retry (HTTP 200) without parsing contract error codes.
 
+### HTTP-layer idempotency keys
+
+In addition to the on-chain `order_id` deduplication, `POST /api/payments`
+supports an `Idempotency-Key` request header. This protects against duplicate
+submissions at the HTTP layer — for example when a client retries after a
+network timeout and the original request actually reached the server.
+
+- Send a unique `Idempotency-Key` header (e.g. a UUID v4) with each logical
+  payment submission.
+- The API caches the response for that key for **24 hours**.
+- Any replay with the same key within that window returns the **cached
+  response** instead of creating a new submission. Replayed responses include
+  `idempotent: true` in the body.
+- Reusing a key with a *different* request payload is rejected.
+
+The two mechanisms are complementary: the `Idempotency-Key` guards the HTTP
+request/response cycle (including retries that never reach the contract),
+while the stable `order_id` guards the on-chain submission itself. Use both —
+a stable `order_id` **and** an `Idempotency-Key` — for full protection.
+
+```typescript
+import axios from 'axios';
+import { v4 as uuidv4 } from 'uuid';
+
+// Generate once per logical payment and reuse on every retry
+const idempotencyKey = uuidv4();
+
+const response = await axios.post('/api/payments', payload, {
+  headers: { 'Idempotency-Key': idempotencyKey },
+});
+// response.data.idempotent === true when a cached response was replayed
+```
+
 ### Example: Node.js retry with axios
 
 ```typescript
 import axios from 'axios';
 
 async function submitPaymentWithRetry(payload, { maxRetries = 3 } = {}) {
+  // Stable across retries so the API can replay the cached response
+  const idempotencyKey = payload.idempotencyKey ?? crypto.randomUUID();
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const response = await axios.post('/api/payments', payload);
+      const response = await axios.post('/api/payments', payload, {
+        headers: { 'Idempotency-Key': idempotencyKey },
+      });
       return response.data; // 201 = new, 200 + idempotent:true = duplicate
     } catch (err) {
       const code = err.response?.data?.error?.code;
@@ -125,6 +163,10 @@ If you derive `order_id` from a hash of the order contents (merchant + payer +
 amount + token), note that any two orders with identical contents will share the
 same ID — this may be intentional (natural deduplication) or a bug depending on
 your use case.
+
+The same rules apply to the `Idempotency-Key` header: generate it once per
+logical payment, persist it alongside the pending `order_id`, and reuse it for
+every retry of that payment.
 
 ---
 
@@ -171,3 +213,14 @@ npm test
 | 42 | `MultisigAlreadyExecuted` | Multisig payment already executed | ✅ Yes — treat as success |
 
 All other error codes represent genuine failures and should not be swallowed.
+
+---
+
+## API reference: `Idempotency-Key` header
+
+| Header | Required | Applies to | Description |
+|---|---|---|---|
+| `Idempotency-Key` | No (recommended) | `POST /api/payments` | Client-generated unique key (e.g. UUID v4). Responses are cached for 24 hours and replayed for repeated requests with the same key. |
+
+Replay responses return the cached status and body, with `idempotent: true`
+added to the JSON body.

@@ -11,6 +11,19 @@ npm install
 npm run dev
 ```
 
+## Component catalogue (Storybook)
+
+```bash
+npm install
+npm run storybook
+```
+
+Opens an interactive catalogue of the UI components at `localhost:6006`,
+including stories for `CopyButton`, `ContractCallStatus`
+(Spinner/ErrorMessage/SuccessBanner), and `NotificationCenter`. Config lives
+in `.storybook/`; add a `*.stories.tsx` file next to a component to document
+it.
+
 ## Features
 - Freighter wallet connection
 - Paginated payment history table (cursor-based)
@@ -18,42 +31,49 @@ npm run dev
 - Sort by date or amount (ascending/descending)
 - Refund status displayed inline per payment
 
-## Security headers
+## Contract Type Generation
 
-The Vite dev server sends the following security headers (configured in `vite.config.ts`). Production deployments **must** send the same headers from the web server or CDN — the dev-server configuration does not apply to the production build.
+`frontend/src/contract.ts` is **auto-generated** from the deployed contract's ABI using the Stellar CLI. **Do not edit it by hand** — any manual changes will be overwritten the next time the types are regenerated, and CI will fail if the committed file drifts from the generated output.
 
-| Header | Value |
-| --- | --- |
-| `Content-Security-Policy` | `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://soroban-testnet.stellar.org https://horizon-testnet.stellar.org; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'` |
-| `X-Frame-Options` | `DENY` |
-| `X-Content-Type-Options` | `nosniff` |
-| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+### Prerequisites
 
-Adjust the `connect-src` origins to match the Stellar/Soroban RPC and Horizon endpoints used in your environment. Keep `frame-ancestors 'none'` and `X-Frame-Options: DENY` together for clickjacking protection across browsers.
+- [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools/cli/install-cli) installed and available on your `PATH`.
+- The contract deployed to the target network (or its WASM available locally).
 
-### Example: nginx
+### Required environment variables
 
-```nginx
-server {
-    listen 443 ssl;
-    server_name app.example.com;
+| Variable      | Description                                                        |
+| ------------- | ------------------------------------------------------------------ |
+| `CONTRACT_ID` | The deployed contract ID (e.g. `C...`) to generate bindings from.  |
+| `NETWORK`     | The Stellar network the contract is deployed to (`testnet`, `mainnet`, `futurenet`, or a custom RPC URL). |
 
-    # ... ssl_certificate, root, location blocks, etc.
+Set these in `frontend/.env` (see `.env.example`) or export them in your shell before running the command.
 
-    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://soroban-testnet.stellar.org https://horizon-testnet.stellar.org; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'" always;
-    add_header X-Frame-Options "DENY" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-}
+### Generation command
+
+From the `frontend/` directory, run:
+
+```bash
+stellar contract bindings typescript \
+  --network "$NETWORK" \
+  --contract-id "$CONTRACT_ID" \
+  --output-dir ./src \
+  --overwrite
 ```
 
-The `always` flag ensures the headers are sent on error responses too. If you use a CDN or managed host (Cloudflare, Netlify, Vercel, S3 + CloudFront, etc.), configure the equivalent response headers there — e.g. a `_headers` file on Netlify, `vercel.json` `headers` entries, or a CloudFront response-headers policy. The CDN/host must be configured equivalently; do not rely on the Vite dev-server headers in production.
+This writes the generated TypeScript types (including `PaymentRecord` and other ABI-derived types) to `frontend/src/contract.ts`.
 
-### Verifying the headers
+> **Note:** If your Stellar CLI version emits the file under a different name (e.g. `index.ts`), rename or re-export it as `contract.ts` so the rest of the app keeps importing from `./contract`.
 
-1. Open the deployed app in a browser and open DevTools (F12).
-2. Go to the **Network** tab and reload the page.
-3. Select the top-level document request and inspect the **Response Headers** section.
-4. Confirm `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, and `Referrer-Policy` are present with the values above.
+### Regenerating after a contract change
 
-CI also runs a header check against the deployed preview URL (see the `security-headers` workflow) to catch regressions.
+Whenever the contract ABI changes (new fields, renamed types, etc.):
+
+1. Redeploy the contract and update `CONTRACT_ID` / `NETWORK` if needed.
+2. Run the generation command above.
+3. Review the diff in `frontend/src/contract.ts` and fix any downstream type errors in the app.
+4. Commit the regenerated `contract.ts` together with the contract change.
+
+### CI drift check
+
+CI regenerates `contract.ts` from the deployed ABI and compares it against the committed file. If they differ, the build **fails** — this catches cases where the contract schema changed but the frontend types were not regenerated. To fix a failing check, run the generation command locally and commit the result.

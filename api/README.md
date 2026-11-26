@@ -92,12 +92,16 @@ List merchant payment history with filtering/pagination.
 Query parameters:
 - `merchant` (required): Merchant address
 - `cursor` (optional): Pagination cursor
-- `limit` (optional): Max results (default 10, max 100)
+- `limit` (optional): Max results (default 10). Capped at `MAX_PAGE_SIZE` (default 100). If `limit` exceeds the cap, the request is rejected with HTTP 422.
 - `date_start`, `date_end` (optional): Unix timestamp range
 - `amount_min`, `amount_max` (optional): Amount range
 - `status` (optional): "Any", "Completed", "PartiallyRefunded", "FullyRefunded"
 - `sort_field` (optional): "Date" or "Amount"
 - `sort_order` (optional): "Ascending" or "Descending"
+
+## Request Body Size Limit
+
+JSON request bodies are limited to **64kb**. Requests with a larger body are rejected with HTTP 413 (Payload Too Large).
 
 ## Error Responses
 
@@ -116,5 +120,6 @@ HTTP status codes map to contract errors:
 - 403: Unauthorized
 - 404: Resource not found (Merchant/Payment/Refund/Multisig)
 - 409: Resource conflict (AlreadyExists, AlreadyCompleted)
-- 422: Invalid input or state (InvalidAmount, PaymentExpired, RefundWindowExpired, etc.)
+- 413: Request body exceeds the 64kb limit
+- 422: Invalid input or state (InvalidAmount, PaymentExpired, RefundWindowExpired, `limit` exceeding `MAX_PAGE_SIZE`, etc.)
 - 500: Internal server error

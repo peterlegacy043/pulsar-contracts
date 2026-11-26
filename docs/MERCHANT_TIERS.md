@@ -42,17 +42,20 @@ records the *result* of that review as a tier.
 
 1. The admin team completes off-chain verification for the merchant address
    at the level required for the target tier.
-2. An admin (or quorum of admins, depending on the deployment's multi-sig
-   threshold — see `set_admin` / `helper::require_multi_admin`) calls:
+2. A quorum of admins meeting the deployment's multi-sig threshold calls:
 
    ```text
    set_merchant_tier(admins: Vec<Address>, merchant_address: Address, tier: MerchantTier)
    ```
 
-   This requires the same multi-sig admin authorization as other admin-only
-   calls (`set_whitelist_mode`, `approve_merchant_registration`, etc.) and
-   fails with `PaymentError::Unauthorized` if the threshold is not met, or
-   `PaymentError::MerchantNotFound` if the merchant does not exist.
+   This call is authorized via `helper::require_multi_admin` (threshold-based
+   multi-sig), not a single-admin check. A single signer, or any set of
+   signers below the configured threshold, is rejected with
+   `PaymentError::Unauthorized`; the call also fails with
+   `PaymentError::MerchantNotFound` if the merchant does not exist. This
+   matches the multi-sig authorization used by other admin-only calls
+   (`set_whitelist_mode`, `approve_merchant_registration`, etc.), so a single
+   compromised admin key cannot upgrade a merchant's tier on its own.
 3. The contract emits a `merchant_tier_set` event with payload
    `(merchant_address, tier)` so the change is auditable off-chain.
 4. A merchant's current tier can be read at any time with:

@@ -141,3 +141,77 @@ fn test_t005_deactivated_merchant_record_preserved() {
     assert!(!record.active);
     assert_eq!(record.name, s(&env, "Test Store"));
 }
+
+// ── MISC-035: merchant self-service deactivation ─────────────────────────────
+
+/// A registered merchant can deactivate their own account via
+/// `self_deactivate_merchant`; the record must show `active = false`.
+#[test]
+fn test_misc035_merchant_self_deactivate_succeeds() {
+    let (env, client) = setup();
+    let (_admin, merchant) = setup_merchant(&env, &client);
+
+    client.self_deactivate_merchant(&merchant);
+
+    assert!(!client.get_merchant(&merchant).active);
+}
+
+/// A random, unregistered caller must not be able to deactivate another
+/// merchant's account through `self_deactivate_merchant`.
+#[test]
+fn test_misc035_random_caller_self_deactivate_unauthorized() {
+    let (env, client) = setup();
+    let (_admin, merchant) = setup_merchant(&env, &client);
+    let random = Address::generate(&env);
+
+    let result = client.try_self_deactivate_merchant(&random);
+    assert!(
+        result == Err(Ok(PaymentError::Unauthorized))
+            || result == Err(Ok(PaymentError::MerchantNotFound)),
+        "expected Unauthorized or MerchantNotFound, got {:?}",
+        result
+    );
+
+    // The real merchant must still be active
+    assert!(client.get_merchant(&merchant).active);
+}
+
+/// Self-deactivation must cancel all active subscriptions belonging to the
+/// merchant.
+#[test]
+fn test_misc035_self_deactivate_cancels_subscriptions() {
+    let (env, client) = setup();
+    let (_admin, merchant) = setup_merchant(&env, &client);
+
+    let subscriber_a = Address::generate(&env);
+    let subscriber_b = Address::generate(&env);
+
+    let sub_a = client.subscribe(
+        &subscriber_a,
+        &merchant,
+        &s(&env, "plan_basic"),
+        &1000,
+        &s(&env, "tok"),
+        &30,
+    );
+    let sub_b = client.subscribe(
+        &subscriber_b,
+        &merchant,
+        &s(&env, "plan_pro"),
+        &2000,
+        &s(&env, "tok"),
+        &30,
+    );
+
+    client.self_deactivate_merchant(&merchant);
+
+    assert!(!client.get_merchant(&merchant).active);
+    assert_eq!(
+        client.get_subscription(&sub_a).status,
+        SubscriptionStatus::Cancelled
+    );
+    assert_eq!(
+        client.get_subscription(&sub_b).status,
+        SubscriptionStatus::Cancelled
+    );
+}

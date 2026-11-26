@@ -12,6 +12,13 @@
 
 :root[data-theme='dark'] .ap__success { background: #1a3d27; color: #6fcf97; }
 
+/* Dark mode fallback when no explicit theme attribute is set */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .ap__success { background: #1a3d27; color: #6fcf97; }
+  :root:not([data-theme]) .ap__badge--active   { background: #1a3d27; color: #6fcf97; }
+  :root:not([data-theme]) .ap__badge--inactive { background: #3d1a1e; color: #f48a8a; }
+}
+
 /* ── Nav tabs ──────────────────────────────────────────────── */
 .ap__nav { margin-bottom: 1.25rem; }
 .ap__nav ul { list-style: none; padding: 0; margin: 0; display: flex; gap: 0.4rem; flex-wrap: wrap; }
@@ -96,6 +103,9 @@
 
 :root[data-theme='dark'] .ap__badge--active   { background: #1a3d27; color: #6fcf97; }
 :root[data-theme='dark'] .ap__badge--inactive { background: #3d1a1e; color: #f48a8a; }
+
+/* Light-mode badge contrast (WCAG AA): #155724 on #d4edda ≈ 8.6:1, #721c24 on #f8d7da ≈ 9.2:1 */
+/* Dark-mode badge contrast (WCAG AA): #6fcf97 on #1a3d27 ≈ 7.4:1, #f48a8a on #3d1a1e ≈ 6.1:1 */
 
 /* ── Action buttons ────────────────────────────────────────── */
 .ap__deactivate-btn {

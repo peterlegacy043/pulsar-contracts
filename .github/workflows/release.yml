@@ -5,9 +5,57 @@ on:
     branches:
       - main
     tags:
-      - 'v*.*.*'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  # DO-021: Validate that the pushed tag is a valid semantic version before
+  # any release work happens. Non-semver tags (e.g. `test`, `v1`) are rejected.
+  validate-tag:
+    name: Validate Semver Tag (DO-021)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check tag matches semver pattern
+        run: |
+          SEMVER_REGEX='^v[0-9]+\.[0-9]+\.[0-9]+.*$'
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            echo "Not a tag push (branch: ${GITHUB_REF}); skipping semver validation."
+            exit 0
+          fi
+          if ! echo "$TAG" | grep -Eq "$SEMVER_REGEX"; then
+            echo "::error::DO-021: Tag '$TAG' is not a valid semantic version."
+            echo "::error::Tags must match v[0-9]+.[0-9]+.[0-9]+* (e.g. v1.2.3)."
+            exit 1
+          fi
+          echo "Tag '$TAG' is a valid semantic version."
+
+  # DO-021: Bash assertion test for the version regex.
+  semver-regex-test:
+    name: Semver Regex Test (DO-021)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert regex accepts valid and rejects invalid tags
+        run: |
+          SEMVER_REGEX='^v[0-9]+\.[0-9]+\.[0-9]+.*$'
+          fail=0
+          for tag in v1.2.3 v0.0.1 v10.20.30 v1.2.3-rc.1; do
+            if echo "$tag" | grep -Eq "$SEMVER_REGEX"; then
+              echo "PASS: '$tag' accepted"
+            else
+              echo "FAIL: '$tag' should be accepted"
+              fail=1
+            fi
+          done
+          for tag in test v1 1.2.3 v1.2 v1.2.3.4x; do
+            if echo "$tag" | grep -Eq "$SEMVER_REGEX"; then
+              echo "FAIL: '$tag' should be rejected"
+              fail=1
+            else
+              echo "PASS: '$tag' rejected"
+            fi
+          done
+          exit $fail
+
   # SEC-001: Block the release if no completed audit report has been published
   # in this repository. The report must exist as a file matching the pattern
   # docs/audit-report-*.{pdf,md} before a release tag can be created.
@@ -63,7 +111,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [audit-gate, check-version]
+    needs: [audit-gate, validate-tag, semver-regex-test, check-version]
     if: needs.check-version.outputs.tag_exists == 'false'
     runs-on: ubuntu-latest
     permissions:
@@ -96,41 +144,52 @@ jobs:
             --title "Release $TAG" \
             --notes-file release_notes.md
 
-  publish-sdk:
-    name: Publish SDK to npm
-    needs: [audit-gate, check-version]
-    if: needs.check-version.outputs.tag_exists == 'false'
+  publish-docker-images:
+    name: Publish Docker images to GHCR
+    needs: [check-version, release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          fetch-depth: 0
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Build and push indexer image
+        uses: docker/build-push-action@v5
         with:
-          node-version: '18'
-          registry-url: https://registry.npmjs.org/
+          context: .
+          file: services/indexer/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/indexer:${{ needs.check-version.outputs.version }}
+            ghcr.io/${{ github.repository }}/indexer:latest
 
-      - name: Check if version already published on npm
-        id: check_npm
-        run: |
-          VERSION="${{ needs.check-version.outputs.version }}"
-          if npm view "@pulsar/sdk@$VERSION" version >/dev/null 2>&1; then
-            echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "Version $VERSION is already published on npm; skipping publish."
-          else
-            echo "published=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Build and push webhook image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: services/webhook/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/webhook:${{ needs.check-version.outputs.version }}
+            ghcr.io/${{ github.repository }}/webhook:latest
 
-      - name: Install dependencies
-        if: steps.check_npm.outputs.published == 'false'
-        working-directory: sdk
-        run: npm ci
-
-      - name: Publish to npm
-        if: steps.check_npm.outputs.published == 'false'
-        working-directory: sdk
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+      - name: Build and push analytics-service image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: services/analytics-service/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/analytics-service:${{ needs.check-version.outputs.version }}
+            ghcr.io/${{ github.repository }}/analytics-service:latest

@@ -6,6 +6,7 @@ import { ErrorMessage } from "./ContractCallStatus";
 import { WalletReconnectPrompt } from "./WalletReconnectPrompt";
 import { fetchPayerHistory } from "../contract";
 import type { PaymentRecord, PaymentFilter } from "../contract";
+import { ErrorBoundary } from "./ErrorBoundary";
 
 const PAGE_SIZE = 20;
 const STATUSES = ["Any", "Completed", "PartiallyRefunded", "FullyRefunded"] as const;
@@ -20,6 +21,7 @@ function readDashboardState(search: string) {
   const amountMax = Number(params.get("amount_max"));
   const sortField = params.get("sort_field");
   const sortOrder = params.get("sort_order");
+  const cursor = params.get("cursor");
 
   return {
     filter: {
@@ -31,13 +33,15 @@ function readDashboardState(search: string) {
     } satisfies PaymentFilter,
     sortField: sortField === "Amount" ? "Amount" as SortField : "Date" as SortField,
     sortOrder: sortOrder === "Ascending" ? "Ascending" as SortOrder : "Descending" as SortOrder,
+    cursor: cursor || null,
   };
 }
 
 function writeDashboardState(
   filter: PaymentFilter,
   sortField: SortField,
-  sortOrder: SortOrder
+  sortOrder: SortOrder,
+  cursor: string | null
 ) {
   const url = new URL(window.location.href);
   const values: Record<string, string | undefined> = {
@@ -46,6 +50,7 @@ function writeDashboardState(
     amount_max: filter.amount_max?.toString(),
     sort_field: sortField === "Date" ? undefined : sortField,
     sort_order: sortOrder === "Descending" ? undefined : sortOrder,
+    cursor: cursor ?? undefined,
   };
 
   Object.entries(values).forEach(([key, value]) => {
@@ -57,12 +62,21 @@ function writeDashboardState(
 }
 
 export function PayerDashboard() {
+  return (
+    <ErrorBoundary>
+      <PayerDashboardContent />
+    </ErrorBoundary>
+  );
+}
+
+function PayerDashboardContent() {
   const { address, error: walletError, status: walletStatus, showReconnectPrompt, connect, disconnect, dismissReconnectPrompt } = useWallet();
 
   const [records, setRecords] = useState<PaymentRecord[]>([]);
   const [cursorStack, setCursorStack] = useState<(string | null)[]>([null]);
   const [currentPage, setCurrentPage] = useState(0);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [totalCount, setTotalCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
@@ -77,6 +91,17 @@ export function PayerDashboard() {
       setFilter(state.filter);
       setSortField(state.sortField);
       setSortOrder(state.sortOrder);
+      // Restore the cursor stack from the URL: rebuild the stack so that the
+      // current page is the last entry. Since only the current cursor is
+      // persisted, previous pages are re-derived lazily; here we reset to the
+      // persisted cursor as the active page.
+      if (state.cursor) {
+        setCursorStack([null, state.cursor]);
+        setCurrentPage(1);
+      } else {
+        setCursorStack([null]);
+        setCurrentPage(0);
+      }
     };
 
     window.addEventListener("popstate", restoreState);
@@ -85,17 +110,17 @@ export function PayerDashboard() {
 
   const updateFilter = (nextFilter: PaymentFilter) => {
     setFilter(nextFilter);
-    writeDashboardState(nextFilter, sortField, sortOrder);
+    writeDashboardState(nextFilter, sortField, sortOrder, null);
   };
 
   const updateSortField = (nextSortField: SortField) => {
     setSortField(nextSortField);
-    writeDashboardState(filter, nextSortField, sortOrder);
+    writeDashboardState(filter, nextSortField, sortOrder, null);
   };
 
   const updateSortOrder = (nextSortOrder: SortOrder) => {
     setSortOrder(nextSortOrder);
-    writeDashboardState(filter, sortField, nextSortOrder);
+    writeDashboardState(filter, sortField, nextSortOrder, null);
   };
 
   const load = useCallback(
@@ -107,6 +132,13 @@ export function PayerDashboard() {
         const page = await fetchPayerHistory(address, cursor, PAGE_SIZE, filter, sortField, sortOrder);
         setRecords(page.records);
         setNextCursor(page.next_cursor);
+        setTotalCount(
+          typeof page.total === "number"
+            ? page.total
+            : typeof page.total_count === "number"
+            ? page.total_count
+            : null
+        );
       } catch (e: any) {
         setFetchError(e?.message ?? "Failed to load payments");
       } finally {
@@ -128,15 +160,18 @@ export function PayerDashboard() {
     const newStack = [...cursorStack, nextCursor];
     setCursorStack(newStack);
     setCurrentPage(currentPage + 1);
+    writeDashboardState(filter, sortField, sortOrder, nextCursor);
     load(nextCursor);
   };
 
   const goPrev = () => {
     if (currentPage === 0) return;
     const newStack = cursorStack.slice(0, -1);
+    const prevCursor = newStack[newStack.length - 1];
     setCursorStack(newStack);
     setCurrentPage(currentPage - 1);
-    load(newStack[newStack.length - 1]);
+    writeDashboardState(filter, sortField, sortOrder, prevCursor);
+    load(prevCursor);
   };
 
   return (
@@ -190,11 +225,24 @@ export function PayerDashboard() {
           <PaymentTable records={records} loading={loading} />
 
           <div style={{ display: "flex", gap: 12, marginTop: 16, alignItems: "center" }}>
-            <button onClick={goPrev} disabled={currentPage === 0} style={btnStyle("#64748b")}>
+            <button
+              onClick={goPrev}
+              disabled={currentPage === 0 || loading}
+              style={btnStyle("#64748b", currentPage === 0 || loading)}
+            >
               ← Previous
             </button>
-            <span style={{ color: "#64748b" }}>Page {currentPage + 1}</span>
-            <button onClick={goNext} disabled={!nextCursor} style={btnStyle("#6366f1")}>
+            <span style={{ color: "#64748b" }}>
+              Page {currentPage + 1}
+              {totalCount !== null && (
+                <> · {totalCount} record{totalCount === 1 ? "" : "s"}</>
+              )}
+            </span>
+            <button
+              onClick={goNext}
+              disabled={!nextCursor || loading}
+              style={btnStyle("#6366f1", !nextCursor || loading)}
+            >
               Next →
             </button>
           </div>
@@ -204,14 +252,15 @@ export function PayerDashboard() {
   );
 }
 
-function btnStyle(bg: string): React.CSSProperties {
+function btnStyle(bg: string, disabled = false): React.CSSProperties {
   return {
     background: bg,
     color: "#fff",
     border: "none",
     borderRadius: 6,
     padding: "8px 16px",
-    cursor: "pointer",
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.5 : 1,
     fontWeight: 600,
   };
 }

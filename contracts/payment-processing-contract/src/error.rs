@@ -7,6 +7,9 @@ use soroban_sdk::contracterror;
 #[repr(u32)]
 pub enum PaymentError {
     // Auth
+    /// Caller is not permitted to perform this action. Also returned by
+    /// `get_merchant_payment_stats` when the caller is neither the admin nor
+    /// the merchant whose stats are being queried.
     Unauthorized = 1,
     AdminAlreadySet = 2,
 
@@ -47,6 +50,9 @@ pub enum PaymentError {
     InsufficientSignatures = 43,
 
     // General
+    /// Generic invalid input. Also returned by `set_cleanup_period` when the
+    /// requested period is outside the allowed range
+    /// (`MIN_CLEANUP_PERIOD..=MAX_CLEANUP_PERIOD`).
     InvalidInput = 50,
     // StorageError = 51 was removed: the variant was never returned by any
     // code path and only inflated the ABI. See issue SC-009.
@@ -69,4 +75,11 @@ pub enum PaymentError {
     /// Enable the allowlist with `set_token_allowlist_mode` and add approved
     /// tokens with `add_allowed_token` before processing payments.
     TokenNotAllowed = 71,
+
+    // Feature flags (MISC-034)
+    /// The feature flag gating this function is disabled.
+    /// The admin can enable it at runtime with `set_feature_flag`; the flag
+    /// name is reported in the error context (e.g. `subscriptions_enabled`,
+    /// `token_allowlist_enforced`). See `docs/FEATURE_FLAGS.md`.
+    FeatureFlagDisabled = 72,
 }

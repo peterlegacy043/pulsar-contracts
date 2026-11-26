@@ -209,6 +209,106 @@ Full error code reference: [`docs/api-reference.md#error-codes`](../docs/api-ref
 
 ---
 
+## Handling Errors
+
+Soroban contracts return raw numeric error codes. The SDK ships a registry that
+maps each code to a human-readable message so you can surface something useful
+to users in the browser.
+
+### Mapping an error to a message
+
+```typescript
+import { getErrorMessage } from '@pulsar-contracts/sdk/errors';
+
+try {
+  await client.processPayment(payload);
+} catch (err) {
+  // getErrorMessage accepts a raw numeric code, a PulsarError, or an unknown value
+  const message = getErrorMessage(err);
+  console.error(message);
+  // => "A payment with this order ID already exists"
+}
+```
+
+`getErrorMessage(err)` accepts a raw numeric code, a `PulsarError` instance, or
+any caught value and always returns a string. Unknown codes fall back to a
+generic message, so it is safe to call on arbitrary errors.
+
+### Using `useContractCall` with error handling
+
+The frontend hook `useContractCall` (`frontend/src/hooks/useContractCall.ts`)
+exposes an `error` state. Combine it with `getErrorMessage` to render the
+mapped message:
+
+```tsx
+import { useContractCall } from '../hooks/useContractCall';
+import { getErrorMessage } from '@pulsar-contracts/sdk/errors';
+
+function PayButton({ payload }: { payload: PaymentPayload }) {
+  const { call, loading, error } = useContractCall();
+
+  const handlePay = async () => {
+    try {
+      await call(() => client.processPayment(payload));
+    } catch (err) {
+      // The hook stores the raw error; map it for display
+      console.error(getErrorMessage(err));
+    }
+  };
+
+  return (
+    <div>
+      <button onClick={handlePay} disabled={loading}>
+        {loading ? 'Processing…' : 'Pay'}
+      </button>
+      {error && <p className="error">{getErrorMessage(error)}</p>}
+    </div>
+  );
+}
+```
+
+### Error code reference
+
+The canonical list lives in [`sdk/error-registry.json`](./error-registry.json).
+The table below mirrors it:
+
+| Code | Name | Message |
+|---|---|---|
+| 1 | `Unauthorized` | Caller is not authorized to perform this action |
+| 2 | `NotInitialized` | Contract has not been initialized |
+| 10 | `InvalidAmount` | Payment amount must be greater than zero |
+| 11 | `InvalidOrderId` | Order ID is invalid or empty |
+| 12 | `InvalidDescription` | Description is invalid or too long |
+| 13 | `InvalidExpiry` | Expiry timestamp is invalid |
+| 20 | `OrderExpired` | This payment order has expired |
+| 21 | `PaymentAlreadyExists` | A payment with this order ID already exists |
+| 22 | `PaymentNotFound` | Payment order was not found |
+| 23 | `PaymentNotPending` | Payment is not in a pending state |
+| 24 | `PaymentAlreadyRefunded` | Payment has already been refunded |
+| 25 | `RefundNotAllowed` | Refund is not allowed for this payment |
+| 30 | `InvalidSignature` | Signature verification failed |
+| 31 | `InvalidPublicKey` | Merchant public key is invalid |
+| 32 | `SignatureMismatch` | Signature does not match the order |
+| 33 | `MissingSignature` | A signature is required |
+| 34 | `InvalidSigner` | Signer does not match the merchant |
+| 35 | `ReplayDetected` | Replay attack detected |
+| 36 | `NonceAlreadyUsed` | Nonce has already been used |
+| 37 | `InvalidNonce` | Nonce is invalid |
+| 38 | `SignatureExpired` | Signature has expired |
+| 40 | `InsufficientBalance` | Payer has insufficient token balance |
+| 41 | `InsufficientAllowance` | Token allowance is insufficient |
+| 42 | `TransferFailed` | Token transfer failed |
+| 43 | `TokenNotSupported` | Token contract is not supported |
+| 50 | `MerchantNotFound` | Merchant was not found |
+| 52 | `MerchantInactive` | Merchant account is inactive |
+| 60 | `ContractPaused` | Contract is currently paused |
+| 61 | `OperationNotAllowed` | Operation is not allowed |
+| 62 | `RateLimitExceeded` | Rate limit exceeded, try again later |
+| 63 | `InvalidState` | Contract is in an invalid state for this operation |
+| 71 | `UnknownError` | An unknown error occurred |
+
+---
+
 ## Building from source
 
 ```bash

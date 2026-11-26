@@ -33,8 +33,12 @@ use proptest::prelude::*;
 use alloc::vec::Vec;
 
 use crate::error::PaymentError;
-use crate::helper::{matches_filter, validate_amount};
+use crate::helper::{matches_filter, validate_amount, validate_metadata_size, MAX_METADATA_SIZE_BYTES};
 use crate::types::{PaymentFilter, PaymentRecord, PaymentStatus, StatusFilter};
+
+use crate::{DataKey, PaymentProcessingContract, PaymentProcessingContractClient};
+use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{Address, Env};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -327,5 +331,151 @@ proptest! {
         // With cap=0 and records present, next_cursor behaviour is implementation-defined;
         // we just assert the page is empty.
         let _ = next_cursor;
+    }
+}
+
+// ── Property 4: dual-storage admin invariant ─────────────────────────────────
+//
+// The contract stores the admin in two places: the legacy single-admin key
+// `DataKey::Admin` and the `AdminConfig` struct (whose `admins[0]` is the
+// primary admin). See the invariant documented in `lib.rs`. These property
+// tests assert that `AdminConfig.admins[0] == DataKey::Admin` holds after
+// every admin-mutating operation: `set_admin`, `transfer_admin`, and
+// `update_admin_config`.
+
+/// Read the legacy single-admin key directly from contract storage.
+fn stored_single_admin(env: &Env, contract_id: &Address) -> Option<Address> {
+    env.as_contract(contract_id, || {
+        env.storage().instance().get(&DataKey::Admin)
+    })
+}
+
+/// Read the `AdminConfig` struct directly from contract storage.
+fn stored_admin_config(
+    env: &Env,
+    contract_id: &Address,
+) -> Option<crate::types::AdminConfig> {
+    env.as_contract(contract_id, || {
+        env.storage().instance().get(&DataKey::AdminConfig)
+    })
+}
+
+/// Assert the dual-storage invariant: `AdminConfig.admins[0] == DataKey::Admin`.
+fn assert_admin_invariant(env: &Env, contract_id: &Address) {
+    let single = stored_single_admin(env, contract_id);
+    let config = stored_admin_config(env, contract_id);
+
+    match (single, config) {
+        (Some(single_admin), Some(cfg)) => {
+            prop_assert!(
+                cfg.admins.len() > 0,
+                "AdminConfig must contain at least one admin"
+            );
+            prop_assert_eq!(
+                cfg.admins.get(0).unwrap(),
+                single_admin,
+                "AdminConfig.admins[0] must equal DataKey::Admin"
+            );
+        }
+        (None, None) => {}
+        _ => prop_assert!(
+            false,
+            "DataKey::Admin and AdminConfig must be set together"
+        ),
+    }
+}
+
+/// Deploy a fresh contract and initialize it with a single admin.
+fn setup_contract(env: &Env) -> (PaymentProcessingContractClient<'_>, Address) {
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, PaymentProcessingContract);
+    let client = PaymentProcessingContractClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    client.initialize(&admin);
+    (client, contract_id)
+}
+
+proptest! {
+    /// The invariant holds after `set_admin` for any newly chosen admin.
+    #[test]
+    fn prop_admin_invariant_after_set_admin(_seed in 0u32..1000u32) {
+        let env = Env::default();
+        let (client, contract_id) = setup_contract(&env);
+
+        let new_admin = Address::generate(&env);
+        client.set_admin(&new_admin);
+
+        assert_admin_invariant(&env, &contract_id);
+        prop_assert_eq!(stored_single_admin(&env, &contract_id), Some(new_admin));
+    }
+
+    /// The invariant holds after `transfer_admin` for any newly chosen admin.
+    #[test]
+    fn prop_admin_invariant_after_transfer_admin(_seed in 0u32..1000u32) {
+        let env = Env::default();
+        let (client, contract_id) = setup_contract(&env);
+
+        let new_admin = Address::generate(&env);
+        client.transfer_admin(&new_admin);
+
+        assert_admin_invariant(&env, &contract_id);
+        prop_assert_eq!(stored_single_admin(&env, &contract_id), Some(new_admin));
+    }
+
+    /// The invariant holds after `update_admin_config` regardless of the
+    /// generated admin list and threshold.
+    #[test]
+    fn prop_admin_invariant_after_update_admin_config(
+        extra_admins in 0usize..5usize,
+        threshold in 1u32..5u32,
+    ) {
+        let env = Env::default();
+        let (client, contract_id) = setup_contract(&env);
+
+        // Build an admin list whose first entry is the current primary admin.
+        let primary = stored_single_admin(&env, &contract_id)
+            .expect("primary admin must be set after initialize");
+        let mut admins: Vec<Address> = Vec::new();
+        admins.push(primary.clone());
+        for _ in 0..extra_admins {
+            admins.push(Address::generate(&env));
+        }
+        let admins_sdk = soroban_sdk::Vec::from_slice(&env, &admins);
+        // Clamp threshold to the number of admins so the config is valid.
+        let threshold = threshold.min(admins.len() as u32).max(1);
+
+        client.update_admin_config(&admins_sdk, &threshold);
+
+        assert_admin_invariant(&env, &contract_id);
+        prop_assert_eq!(stored_single_admin(&env, &contract_id), Some(primary));
+    }
+
+    /// The invariant holds across a random sequence of admin operations.
+    #[test]
+    fn prop_admin_invariant_across_operations(
+        ops in proptest::collection::vec(0u8..3u8, 1..10),
+    ) {
+        let env = Env::default();
+        let (client, contract_id) = setup_contract(&env);
+
+        for op in ops {
+            match op {
+                0 => {
+                    let new_admin = Address::generate(&env);
+                    client.set_admin(&new_admin);
+                }
+                1 => {
+                    let new_admin = Address::generate(&env);
+                    client.transfer_admin(&new_admin);
+                }
+                _ => {
+                    let primary = stored_single_admin(&env, &contract_id)
+                        .expect("primary admin must be set");
+                    let admins_sdk = soroban_sdk::Vec::from_slice(&env, &[primary]);
+                    client.update_admin_config(&admins_sdk, &1u32);
+                }
+            }
+            assert_admin_invariant(&env, &contract_id);
+        }
     }
 }

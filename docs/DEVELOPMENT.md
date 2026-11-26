@@ -9,6 +9,7 @@ This guide provides instructions for setting up a development environment and wo
 - [Building](#building)
 - [Testing](#testing)
 - [Local Network](#local-network)
+- [Docker Compose Health Checks](#docker-compose-health-checks)
 - [Environment Seeding](#environment-seeding)
 - [Debugging](#debugging)
 - [Common Tasks](#common-tasks)
@@ -132,6 +133,75 @@ cargo install cargo-tarpaulin
 cargo tarpaulin --out Html --output-dir coverage
 ```
 
+### Load Testing (Concurrent Payments)
+
+The contract must behave correctly under concurrent payment submissions. A load
+test submits many payments in parallel and verifies that the global payment
+index and `GlobalStats.total_payments` stay consistent.
+
+#### Prerequisites
+
+- A deployed contract on **testnet** (see [Common Tasks](#deploy-contract))
+- A funded admin account secret on testnet
+- Node.js 18+ (for the `@stellar/stellar-sdk` script) or the Stellar CLI
+
+#### Required Environment Variables
+
+| Variable        | Description                                              |
+| --------------- | -------------------------------------------------------- |
+| `CONTRACT_ID`   | Deployed contract ID (`C...`)                            |
+| `ADMIN_SECRET`  | Secret key (`S...`) of the funded admin/payer account    |
+| `NETWORK`       | Network to target, e.g. `testnet`                        |
+| `CONCURRENCY`   | Number of concurrent payments to submit (default `100`)  |
+
+#### Run the Load Test
+
+```bash
+export CONTRACT_ID="<testnet_contract_id>"
+export ADMIN_SECRET="<funded_testnet_secret>"
+export NETWORK="testnet"
+export CONCURRENCY=100
+
+# Shell wrapper (invokes the Node script)
+bash scripts/load-test.sh
+
+# Or run the Node script directly
+node scripts/load-test.js
+```
+
+#### Interpreting Results
+
+- **Every transaction must either succeed or fail with an expected contract
+  error** (e.g. duplicate order ID, expired order, insufficient balance). A
+  panic, trap, or unexpected host error indicates a bug and the test fails.
+- The script prints a summary of successes, expected failures, and unexpected
+  failures. Any unexpected failure is reported with the transaction hash and
+  error for triage.
+
+#### Verifying `GlobalStats.total_payments`
+
+After the run, query the global stats and confirm `total_payments` equals the
+number of successful payments reported by the load test:
+
+```bash
+stellar contract invoke --id $CONTRACT_ID --source-account admin --network testnet \
+  -- get_global_payment_stats --admins '["<ADMIN_ADDRESS>"]' --date_start null --date_end null
+```
+
+The `total_payments` field must match the success count from the load test
+summary. A mismatch means the global index or stats increment is not
+concurrency-safe.
+
+#### Manual CI Step
+
+The load test is **not** run on every push (it targets testnet and consumes
+funds). It is exposed as a manual `workflow_dispatch` CI job. Trigger it from
+the GitHub Actions tab (**Run workflow**) or via the CLI:
+
+```bash
+gh workflow run load-test.yml -f concurrency=100
+```
+
 ## Local Network
 
 ### Start Local Network
@@ -157,6 +227,76 @@ stellar network container restart local
 ```bash
 stellar network container logs local
 ```
+
+## Docker Compose Health Checks
+
+The `docker-compose.yml` stack uses health checks to prevent services from starting before their dependencies are ready.
+
+### PostgreSQL Health Check
+
+The `postgres` service defines a `healthcheck` that runs `pg_isready` inside the container:
+
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pulsar} -d ${POSTGRES_DB:-pulsar}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+```
+
+Postgres is only marked `healthy` once `pg_isready` succeeds, so dependent services never connect to a database that is still initializing.
+
+### Service Dependencies
+
+The `indexer` and `api` services wait for PostgreSQL to become healthy before starting:
+
+```yaml
+services:
+  indexer:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    depends_on:
+      postgres:
+        condition: service_healthy
+```
+
+If the database fails to become healthy within the configured retries, `docker compose up` reports the failure instead of leaving services in a crash loop that requires manual restarts.
+
+### Health Endpoints
+
+The `indexer` and `webhook` services expose an HTTP `/health` endpoint that returns `200 OK` when the service is ready:
+
+```bash
+# Indexer health
+curl -f http://localhost:3001/health
+
+# Webhook service health
+curl -f http://localhost:3002/health
+```
+
+These endpoints are also used by the containers' own `healthcheck` blocks, so `docker compose ps` reflects their readiness.
+
+### Inspecting Health Status
+
+```bash
+# Show container status, including health
+docker compose ps
+
+# Inspect the raw health state of a specific service
+docker inspect --format '{{json .State.Health}}' $(docker compose ps -q postgres)
+
+# Follow health check logs
+docker compose logs -f postgres indexer webhook
+```
+
+A healthy stack shows `(healthy)` next to each service in `docker compose ps`. Services still starting show `(health: starting)`, and failing checks show `(unhealthy)`.
 
 ## Environment Seeding
 
