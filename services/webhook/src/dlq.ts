@@ -8,10 +8,14 @@
  *
  * Storage
  * -------
- * This module uses an in-memory store that is intentionally kept simple.
- * For production deployments replace the Map with a database table or a
- * managed queue (e.g. SQS, Redis Stream) and update the persistence
- * helpers accordingly.
+ * Entries are persisted to the `dlq_entries` database table (see
+ * services/webhook/migrations/001_create_dlq_entries.sql) via the shared
+ * pg Pool.  This ensures permanently failed deliveries survive process
+ * restarts and can still be replayed through the admin API afterwards.
+ *
+ * On startup, call `loadOpenEntries()` to warm the in-process cache of
+ * open (non-replayed) entries.  All read/write operations go to the DB;
+ * the cache is only used for fast depth checks and alerting.
  *
  * Alert threshold
  * ---------------
@@ -21,6 +25,7 @@
  * CloudWatch, Datadog, PagerDuty).
  */
 
+import { Pool } from "pg";
 import { WebhookPayload } from "./deliver";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -55,15 +60,92 @@ export interface DlqEntry {
   replayAttempts: number;
 }
 
-// ── In-memory store ────────────────────────────────────────────────────────────
+// ── Database connection ────────────────────────────────────────────────────────
 
-// In production replace this with a DB query / queue client.
-const dlq = new Map<string, DlqEntry>();
+/**
+ * Shared pg Pool.  Reuses DATABASE_URL from the environment.  A single
+ * pool is created lazily so importing this module does not require a
+ * live database (useful for unit tests that inject a mock pool).
+ */
+let _pool: Pool | undefined;
+
+export function getPool(): Pool {
+  if (!_pool) {
+    _pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  }
+  return _pool;
+}
+
+/** Override the pool (used by tests). */
+export function setPool(pool: Pool | undefined): void {
+  _pool = pool;
+}
+
+// ── In-process cache of open entries ──────────────────────────────────────────
+
+// Mirrors non-replayed rows so depth()/alerting avoid a DB round-trip.
+const openEntries = new Map<string, DlqEntry>();
 let _sequenceCounter = 0;
 
 function generateId(): string {
   _sequenceCounter += 1;
   return `dlq_${Date.now()}_${_sequenceCounter}`;
+}
+
+// ── Row mapping ───────────────────────────────────────────────────────────────
+
+interface DlqRow {
+  id: string;
+  url: string;
+  payload: WebhookPayload;
+  first_attempt_at: string | Date;
+  failed_at: string | Date;
+  attempts: number;
+  last_error: string;
+  last_replay_at: string | Date | null;
+  replay_attempts: number;
+  replayed: boolean;
+}
+
+function toIso(value: string | Date): string {
+  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+}
+
+function rowToEntry(row: DlqRow): DlqEntry {
+  return {
+    id: row.id,
+    url: row.url,
+    payload: row.payload,
+    firstAttemptAt: toIso(row.first_attempt_at),
+    failedAt: toIso(row.failed_at),
+    attempts: row.attempts,
+    lastError: row.last_error,
+    lastReplayAt: row.last_replay_at ? toIso(row.last_replay_at) : undefined,
+    replayAttempts: row.replay_attempts,
+  };
+}
+
+// ── Startup loading ───────────────────────────────────────────────────────────
+
+/**
+ * Load all open (non-replayed) DLQ entries from the database into the
+ * in-process cache.  Call once on service startup so alerting and depth
+ * checks reflect persisted state after a restart.
+ */
+export async function loadOpenEntries(): Promise<DlqEntry[]> {
+  const { rows } = await getPool().query<DlqRow>(
+    `SELECT id, url, payload, first_attempt_at, failed_at, attempts,
+            last_error, last_replay_at, replay_attempts, replayed
+       FROM dlq_entries
+      WHERE replayed = false
+      ORDER BY failed_at DESC`,
+  );
+  openEntries.clear();
+  const entries = rows.map(rowToEntry);
+  for (const entry of entries) {
+    openEntries.set(entry.id, entry);
+  }
+  return entries;
 }
 
 // ── Core DLQ operations ────────────────────────────────────────────────────────
@@ -75,13 +157,13 @@ function generateId(): string {
  * If the DLQ depth exceeds DLQ_ALERT_THRESHOLD a warning is also emitted —
  * wire this to your alerting integration.
  */
-export function enqueue(
+export async function enqueue(
   url: string,
   payload: WebhookPayload,
   attempts: number,
   lastError: string,
   firstAttemptAt: string,
-): DlqEntry {
+): Promise<DlqEntry> {
   const entry: DlqEntry = {
     id: generateId(),
     url,
@@ -93,7 +175,26 @@ export function enqueue(
     replayAttempts: 0,
   };
 
-  dlq.set(entry.id, entry);
+  await getPool().query(
+    `INSERT INTO dlq_entries
+       (id, url, payload, first_attempt_at, failed_at, attempts,
+        last_error, last_replay_at, replay_attempts, replayed)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [
+      entry.id,
+      entry.url,
+      JSON.stringify(entry.payload),
+      entry.firstAttemptAt,
+      entry.failedAt,
+      entry.attempts,
+      entry.lastError,
+      entry.lastReplayAt ?? null,
+      entry.replayAttempts,
+      false,
+    ],
+  );
+
+  openEntries.set(entry.id, entry);
 
   console.error(
     `[dlq] Permanent delivery failure — enqueued id=${entry.id} url=${url} attempts=${attempts} error="${lastError}"`,
@@ -107,8 +208,15 @@ export function enqueue(
 /**
  * Retrieve a single DLQ entry by ID.
  */
-export function getEntry(id: string): DlqEntry | undefined {
-  return dlq.get(id);
+export async function getEntry(id: string): Promise<DlqEntry | undefined> {
+  const { rows } = await getPool().query<DlqRow>(
+    `SELECT id, url, payload, first_attempt_at, failed_at, attempts,
+            last_error, last_replay_at, replay_attempts, replayed
+       FROM dlq_entries
+      WHERE id = $1`,
+    [id],
+  );
+  return rows.length > 0 ? rowToEntry(rows[0]) : undefined;
 }
 
 /**
@@ -116,49 +224,81 @@ export function getEntry(id: string): DlqEntry | undefined {
  *
  * Optionally filter to entries for a specific merchant URL prefix.
  */
-export function listEntries(urlPrefix?: string): DlqEntry[] {
-  const all = Array.from(dlq.values()).sort(
-    (a, b) => new Date(b.failedAt).getTime() - new Date(a.failedAt).getTime(),
-  );
-  if (urlPrefix) {
-    return all.filter((e) => e.url.startsWith(urlPrefix));
-  }
-  return all;
+export async function listEntries(urlPrefix?: string): Promise<DlqEntry[]> {
+  const { rows } = urlPrefix
+    ? await getPool().query<DlqRow>(
+        `SELECT id, url, payload, first_attempt_at, failed_at, attempts,
+                last_error, last_replay_at, replay_attempts, replayed
+           FROM dlq_entries
+          WHERE url LIKE $1
+          ORDER BY failed_at DESC`,
+        [`${urlPrefix}%`],
+      )
+    : await getPool().query<DlqRow>(
+        `SELECT id, url, payload, first_attempt_at, failed_at, attempts,
+                last_error, last_replay_at, replay_attempts, replayed
+           FROM dlq_entries
+          ORDER BY failed_at DESC`,
+      );
+  return rows.map(rowToEntry);
 }
 
 /**
- * Current DLQ depth (number of entries).
+ * Current DLQ depth (number of open, non-replayed entries).
  */
 export function depth(): number {
-  return dlq.size;
+  return openEntries.size;
 }
 
 /**
  * Remove a DLQ entry after a successful replay.
  */
-export function remove(id: string): boolean {
-  return dlq.delete(id);
+export async function remove(id: string): Promise<boolean> {
+  const result = await getPool().query(
+    `DELETE FROM dlq_entries WHERE id = $1`,
+    [id],
+  );
+  openEntries.delete(id);
+  return (result.rowCount ?? 0) > 0;
 }
 
 /**
  * Mark a replay attempt on an entry (before the attempt is made).
  */
-export function markReplayAttempt(id: string): DlqEntry | undefined {
-  const entry = dlq.get(id);
-  if (!entry) return undefined;
-  const updated: DlqEntry = {
-    ...entry,
-    lastReplayAt: new Date().toISOString(),
-    replayAttempts: entry.replayAttempts + 1,
-  };
-  dlq.set(id, updated);
+export async function markReplayAttempt(
+  id: string,
+): Promise<DlqEntry | undefined> {
+  const { rows } = await getPool().query<DlqRow>(
+    `UPDATE dlq_entries
+        SET last_replay_at = $2,
+            replay_attempts = replay_attempts + 1
+      WHERE id = $1
+      RETURNING id, url, payload, first_attempt_at, failed_at, attempts,
+                last_error, last_replay_at, replay_attempts, replayed`,
+    [id, new Date().toISOString()],
+  );
+  if (rows.length === 0) return undefined;
+  const updated = rowToEntry(rows[0]);
+  openEntries.set(id, updated);
   return updated;
+}
+
+/**
+ * Mark an entry as replayed (kept for audit) and drop it from the open cache.
+ */
+export async function markReplayed(id: string): Promise<boolean> {
+  const result = await getPool().query(
+    `UPDATE dlq_entries SET replayed = true WHERE id = $1`,
+    [id],
+  );
+  openEntries.delete(id);
+  return (result.rowCount ?? 0) > 0;
 }
 
 // ── Alert helper ──────────────────────────────────────────────────────────────
 
 function checkAlertThreshold(): void {
-  const current = dlq.size;
+  const current = openEntries.size;
   if (current >= DLQ_ALERT_THRESHOLD) {
     console.warn(
       `[dlq] ALERT: DLQ depth ${current} has reached or exceeded threshold ${DLQ_ALERT_THRESHOLD}. ` +

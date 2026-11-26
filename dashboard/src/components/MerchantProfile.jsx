@@ -45,7 +45,21 @@ export default function MerchantProfile({ publicKey, walletType }) {
       </h3>
 
       {loading && (
-        <p aria-live="polite" className="loading-state">Loading stats…</p>
+        <>
+          <p aria-live="polite" className="loading-state">Loading stats…</p>
+          <dl
+            className="profile-grid skeleton-grid"
+            style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))' }}
+            aria-hidden="true"
+          >
+            {[0, 1, 2, 3].map(i => (
+              <div className="profile-field skeleton-field" key={i}>
+                <span className="skeleton-block skeleton-term" />
+                <span className="skeleton-block skeleton-value" />
+              </div>
+            ))}
+          </dl>
+        </>
       )}
       {error && (
         <div role="alert" className="alert alert-warning">

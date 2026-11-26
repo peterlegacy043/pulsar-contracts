@@ -283,6 +283,8 @@ async function poll() {
     if (response.events.length) {
       logWithRequestId(pollRequestId, `Indexed ${response.events.length} events`);
     }
+
+    consecutiveErrors = 0;
   } catch (err) {
     logErrorWithRequestId(pollRequestId, 'Poll error:', err.message);
   }
